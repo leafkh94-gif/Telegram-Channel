@@ -15,38 +15,43 @@ from strategy.indicators import swing_highs, swing_lows
 
 
 class LiquiditySweepDetector:
-    def __init__(self, lookback: int = 20, sweep_lookback: int = 3):
+    def __init__(self, lookback: int = 20, sweep_lookback: int = 3, scan_window: int = 4):
         """
         lookback:       number of recent candles to search for the swing pivot level.
         sweep_lookback: pivot detection window (bars each side of the pivot).
                         3 = meaningful pivot, not too strict, not too loose.
+        scan_window:    how many of the most recent bars to test as the sweep
+                        candle. Sweeps often complete over 3-4 bars (spike →
+                        consolidation → rejection); a 2-bar window misses
+                        setups that finish between scans.
         """
         self.lookback = lookback
         self.sweep_lookback = sweep_lookback
+        self.scan_window = scan_window
 
     @property
     def min_candles(self) -> int:
-        return self.lookback + self.sweep_lookback * 2 + 2
+        return self.lookback + self.sweep_lookback * 2 + self.scan_window
 
     def detect(self, candles: Sequence[Candle]) -> Optional[str]:
         """
-        Examines the last 2 completed candles for a liquidity sweep pattern.
-        Returns 'buy', 'sell', or None.
+        Examines the last scan_window completed candles for a liquidity sweep
+        pattern. Returns 'buy', 'sell', or None.
         """
         if len(candles) < self.min_candles:
             return None
 
-        window = list(candles[-(self.lookback + self.sweep_lookback * 2 + 1):])
+        window = list(candles[-(self.lookback + self.sweep_lookback * 2 + self.scan_window):])
 
         sh = swing_highs(window, self.sweep_lookback)
         sl = swing_lows(window, self.sweep_lookback)
 
-        # Pivot levels — exclude the last 2 bars (the sweep candidates)
-        recent_highs = [v for v in sh[:-2] if v is not None]
-        recent_lows  = [v for v in sl[:-2] if v is not None]
+        # Pivot levels — exclude the scan-window bars (the sweep candidates)
+        recent_highs = [v for v in sh[:-self.scan_window] if v is not None]
+        recent_lows  = [v for v in sl[:-self.scan_window] if v is not None]
 
-        # Check each of the last 2 bars as a potential sweep candle
-        for bar in list(candles)[-2:]:
+        # Check each recent bar as a potential sweep candle
+        for bar in list(candles)[-self.scan_window:]:
             # Bearish sweep of a swing low → buy signal
             if recent_lows:
                 nearest_low = recent_lows[-1]   # most recent swing low by time

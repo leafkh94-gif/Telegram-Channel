@@ -143,6 +143,7 @@ def _build_prompt(signal: Signal, candles: Sequence[Candle]) -> str:
     return (
         f"Liquidity-sweep {signal.direction.upper()} reversal signal "
         f"({sweep_desc}).\n"
+        f"Size          : {signal.lots:.2f} lots\n"
         f"Current price : {last.close:.2f}\n"
         f"EMA-20        : {ema_str} (price is {trend_rel} EMA-20)\n"
         f"ATR-14 avg    : {avg_atr:.2f}\n"

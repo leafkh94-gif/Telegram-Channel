@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _DEMO_BASE = "https://demo-api-capital.backend-capital.com/api/v1"
 _LIVE_BASE = "https://api-capital.backend-capital.com/api/v1"
-_PING_INTERVAL = 8 * 60   # seconds; session expires after 10 min idle
+_PING_INTERVAL = 5 * 60   # seconds; session expires after 10 min idle — 5 min gives a 5 min safety margin
 _ORDER_MIN_GAP = 0.11     # ≥ 0.1 s between consecutive order submissions
 _TIMEOUT = 15             # HTTP request timeout in seconds
 
