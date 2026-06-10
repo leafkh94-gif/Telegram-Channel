@@ -15,6 +15,7 @@ from agents.base import AgentVerdict, TradeDecision
 from agents.market_agent import MarketAgent
 from agents.news_agent import NewsAgent
 from agents.risk_agent import RiskAgent
+from agents.sentiment_agent import SentimentAgent
 from strategy.base import TF_H1
 from strategy.indicators import atr as _atr
 
@@ -29,11 +30,13 @@ class Orchestrator:
         self,
         market_agent: MarketAgent | None = None,
         news_agent: NewsAgent | None = None,
+        sentiment_agent: SentimentAgent | None = None,
         risk_agent: RiskAgent | None = None,
     ):
-        self._market = market_agent or MarketAgent()
-        self._news   = news_agent   or NewsAgent()
-        self._risk   = risk_agent   or RiskAgent()
+        self._market    = market_agent    or MarketAgent()
+        self._news      = news_agent      or NewsAgent()
+        self._sentiment = sentiment_agent or SentimentAgent()
+        self._risk      = risk_agent      or RiskAgent()
 
     def decide(self, epic: str, candles: dict) -> TradeDecision:
         """
@@ -56,7 +59,15 @@ class Orchestrator:
         if news_v.verdict != "GO":
             return self._skip(news_v.reason, [market_v, news_v])
 
-        # ── Step 3: risk / lot sizing ─────────────────────────────────────────
+        # ── Step 3: sentiment validation ──────────────────────────────────────
+        sentiment_v = self._sentiment.evaluate(epic, direction)
+        logger.info("Orchestrator [%s] sentiment: %s — %s",
+                    epic, sentiment_v.verdict, sentiment_v.reason)
+
+        if sentiment_v.verdict != "GO":
+            return self._skip(sentiment_v.reason, [market_v, news_v, sentiment_v])
+
+        # ── Step 4: risk / lot sizing ─────────────────────────────────────────
         h1         = candles.get(TF_H1, [])
         atr_series = _atr(h1, period=14)
         valid_atr  = [v for v in atr_series if v == v]
@@ -72,10 +83,10 @@ class Orchestrator:
         logger.info("Orchestrator [%s] risk:   %s — %s", epic, risk_v.verdict, risk_v.reason)
 
         if risk_v.verdict != "GO":
-            return self._skip(risk_v.reason, [market_v, news_v, risk_v])
+            return self._skip(risk_v.reason, [market_v, news_v, sentiment_v, risk_v])
 
         # ── All GO ────────────────────────────────────────────────────────────
-        verdicts   = [market_v, news_v, risk_v]
+        verdicts   = [market_v, news_v, sentiment_v, risk_v]
         confidence = min(v.confidence for v in verdicts)
         lots       = risk_v.lots or 0.01
 

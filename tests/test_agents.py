@@ -10,6 +10,7 @@ from agents.base import AgentVerdict, TradeDecision
 from agents.market_agent import MarketAgent
 from agents.news_agent import NewsAgent
 from agents.risk_agent import RiskAgent
+from agents.sentiment_agent import SentimentAgent, _score_post
 from agents.orchestrator import Orchestrator
 from strategy.base import Candle, TF_H1, TF_H4
 from strategy.gold_strategy import GoldStrategy
@@ -246,6 +247,76 @@ def test_risk_agent_index_contract():
     assert result.lots == pytest.approx(0.10, rel=1e-3)
 
 
+# ── SentimentAgent ───────────────────────────────────────────────────────────
+
+def test_score_post_bullish():
+    assert _score_post("gold rally, bulls and bull market signal buy signal") == 1
+
+
+def test_score_post_bearish():
+    assert _score_post("gold crash, bears and bear market signal sell signal") == -1
+
+
+def test_score_post_neutral():
+    assert _score_post("gold trading sideways ahead of fed decision") == 0
+
+
+def test_sentiment_go_when_no_posts():
+    agent = SentimentAgent()
+    with patch("agents.sentiment_agent._get_posts", return_value=[]):
+        result = agent.evaluate("GOLD", "buy")
+    assert result.verdict == "GO"
+    assert result.agent == "sentiment"
+
+
+def test_sentiment_go_when_aligned():
+    import time as _t
+    agent = SentimentAgent(bull_threshold=1)
+    posts = [
+        {"title": "gold bull market breakout, buy signal confirmed",   "pub_ts": _t.time() - 300, "source": "reddit"},
+        {"title": "gold bullish surge, bulls targeting new highs",     "pub_ts": _t.time() - 600, "source": "news"},
+    ]
+    with patch("agents.sentiment_agent._get_posts", return_value=posts):
+        result = agent.evaluate("GOLD", "buy")
+    assert result.verdict == "GO"
+
+
+def test_sentiment_hold_when_contradicts():
+    import time as _t
+    agent = SentimentAgent(bear_threshold=-1)
+    posts = [
+        {"title": "gold crash, bears and bear market send sell signal", "pub_ts": _t.time() - 300, "source": "reddit"},
+        {"title": "gold bearish breakdown on precious metal",           "pub_ts": _t.time() - 600, "source": "news"},
+    ]
+    with patch("agents.sentiment_agent._get_posts", return_value=posts):
+        result = agent.evaluate("GOLD", "buy")   # BUY vs bearish sentiment
+    assert result.verdict == "HOLD"
+
+
+def test_sentiment_go_on_old_posts():
+    import time as _t
+    agent = SentimentAgent(bear_threshold=-1)
+    # Posts older than SENTIMENT_WINDOW_H (3h) are ignored
+    old_posts = [
+        {"title": "gold crash, bears and bear market signal",           "pub_ts": _t.time() - 4 * 3600, "source": "reddit"},
+    ]
+    with patch("agents.sentiment_agent._get_posts", return_value=old_posts):
+        result = agent.evaluate("GOLD", "buy")
+    assert result.verdict == "GO"
+
+
+def test_sentiment_ignores_irrelevant_posts():
+    import time as _t
+    agent = SentimentAgent(bear_threshold=-1)
+    posts = [
+        # Bearish but mentions oil, not gold
+        {"title": "oil crash, energy bears take control",               "pub_ts": _t.time() - 300, "source": "reddit"},
+    ]
+    with patch("agents.sentiment_agent._get_posts", return_value=posts):
+        result = agent.evaluate("GOLD", "buy")
+    assert result.verdict == "GO"
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def _mock_market(direction: str | None):
@@ -272,6 +343,15 @@ def _mock_news(verdict: str):
     return agent
 
 
+def _mock_sentiment(verdict: str = "GO"):
+    agent = MagicMock()
+    agent.evaluate.return_value = AgentVerdict(
+        agent="sentiment", verdict=verdict, confidence=0.70,
+        reason="test",
+    )
+    return agent
+
+
 def _mock_risk(lots: float = 0.07):
     agent = MagicMock()
     agent.evaluate.return_value = AgentVerdict(
@@ -290,6 +370,7 @@ def test_orchestrator_skip_when_market_hold():
     orch = Orchestrator(
         market_agent=_mock_market(None),
         news_agent=_mock_news("GO"),
+        sentiment_agent=_mock_sentiment("GO"),
         risk_agent=_mock_risk(),
     )
     decision = orch.decide("GOLD", _candles_with_atr())
@@ -300,6 +381,7 @@ def test_orchestrator_skip_when_news_hold():
     orch = Orchestrator(
         market_agent=_mock_market("buy"),
         news_agent=_mock_news("HOLD"),
+        sentiment_agent=_mock_sentiment("GO"),
         risk_agent=_mock_risk(),
     )
     decision = orch.decide("GOLD", _candles_with_atr())
@@ -310,6 +392,18 @@ def test_orchestrator_skip_when_news_block():
     orch = Orchestrator(
         market_agent=_mock_market("buy"),
         news_agent=_mock_news("BLOCK"),
+        sentiment_agent=_mock_sentiment("GO"),
+        risk_agent=_mock_risk(),
+    )
+    decision = orch.decide("GOLD", _candles_with_atr())
+    assert decision.action == "skip"
+
+
+def test_orchestrator_skip_when_sentiment_hold():
+    orch = Orchestrator(
+        market_agent=_mock_market("buy"),
+        news_agent=_mock_news("GO"),
+        sentiment_agent=_mock_sentiment("HOLD"),
         risk_agent=_mock_risk(),
     )
     decision = orch.decide("GOLD", _candles_with_atr())
@@ -320,6 +414,7 @@ def test_orchestrator_fires_when_all_go():
     orch = Orchestrator(
         market_agent=_mock_market("buy"),
         news_agent=_mock_news("GO"),
+        sentiment_agent=_mock_sentiment("GO"),
         risk_agent=_mock_risk(lots=0.07),
     )
     decision = orch.decide("GOLD", _candles_with_atr())
@@ -332,6 +427,7 @@ def test_orchestrator_sell_signal():
     orch = Orchestrator(
         market_agent=_mock_market("sell"),
         news_agent=_mock_news("GO"),
+        sentiment_agent=_mock_sentiment("GO"),
         risk_agent=_mock_risk(lots=0.05),
     )
     decision = orch.decide("GOLD", _candles_with_atr())
@@ -340,25 +436,27 @@ def test_orchestrator_sell_signal():
 
 def test_orchestrator_confidence_is_minimum():
     orch = Orchestrator(
-        market_agent=_mock_market("buy"),
-        news_agent=_mock_news("GO"),
-        risk_agent=_mock_risk(lots=0.07),
+        market_agent=_mock_market("buy"),    # 0.80
+        news_agent=_mock_news("GO"),         # 0.95
+        sentiment_agent=_mock_sentiment("GO"),  # 0.70
+        risk_agent=_mock_risk(lots=0.07),    # 1.00
     )
-    # Market=0.80, News=0.95, Risk=1.00 → min = 0.80
+    # min(0.80, 0.95, 0.70, 1.00) = 0.70
     decision = orch.decide("GOLD", _candles_with_atr())
-    assert decision.confidence == pytest.approx(0.80)
+    assert decision.confidence == pytest.approx(0.70)
 
 
 def test_orchestrator_verdicts_attached():
     orch = Orchestrator(
         market_agent=_mock_market("buy"),
         news_agent=_mock_news("GO"),
+        sentiment_agent=_mock_sentiment("GO"),
         risk_agent=_mock_risk(),
     )
     decision = orch.decide("GOLD", _candles_with_atr())
-    assert len(decision.verdicts) == 3
+    assert len(decision.verdicts) == 4
     agents = {v.agent for v in decision.verdicts}
-    assert agents == {"market", "news", "risk"}
+    assert agents == {"market", "news", "sentiment", "risk"}
 
 
 def test_orchestrator_news_not_called_when_market_hold():
@@ -366,7 +464,20 @@ def test_orchestrator_news_not_called_when_market_hold():
     orch = Orchestrator(
         market_agent=_mock_market(None),
         news_agent=news,
+        sentiment_agent=_mock_sentiment("GO"),
         risk_agent=_mock_risk(),
     )
     orch.decide("GOLD", _candles_with_atr())
     news.evaluate.assert_not_called()
+
+
+def test_orchestrator_sentiment_not_called_when_news_blocks():
+    sentiment = _mock_sentiment("GO")
+    orch = Orchestrator(
+        market_agent=_mock_market("buy"),
+        news_agent=_mock_news("BLOCK"),
+        sentiment_agent=sentiment,
+        risk_agent=_mock_risk(),
+    )
+    orch.decide("GOLD", _candles_with_atr())
+    sentiment.evaluate.assert_not_called()
