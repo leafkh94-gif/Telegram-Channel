@@ -55,7 +55,7 @@ SR_CONFLUENCE_ATR_MULT = 1.0        # entry must be within this × H1 ATR of a k
 # ── Risk-based position sizing ────────────────────────────────────────────────
 # Set ACCOUNT_SIZE_USD in your .env to match your actual account balance.
 # RISK_PER_TRADE_PCT is the fraction of the account risked on each trade (1% default).
-ACCOUNT_SIZE_USD   = float(os.getenv("ACCOUNT_SIZE_USD",  "1000"))
+ACCOUNT_SIZE_USD   = float(os.getenv("ACCOUNT_SIZE_USD",  "2000"))
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.01"))
 MIN_LOTS           = 0.01
 MAX_LOTS           = 0.10
