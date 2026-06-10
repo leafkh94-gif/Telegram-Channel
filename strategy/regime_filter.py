@@ -13,13 +13,15 @@ class RegimeFilter:
     def __init__(
         self,
         atr_period: int = 14,
-        ema_fast: int = 20,
-        ema_slow: int = 50,
+        ema_fast: int = 50,
+        ema_slow: int = 200,
         volatile_atr_pct: float = 0.018,
     ):
         """
         volatile_atr_pct: if ATR / close > this fraction → VOLATILE (avoid trading).
         ema_fast / ema_slow: short-term vs. long-term EMA cross for direction.
+        50/200 on H4 keeps the regime stable for weeks; shorter pairs (20/50)
+        flip every few days and whipsaw the classification.
         """
         self.atr_period = atr_period
         self.ema_fast = ema_fast

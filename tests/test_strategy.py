@@ -133,21 +133,21 @@ def test_regime_insufficient_data_returns_ranging():
 
 def test_regime_volatile_candles():
     rf = RegimeFilter(volatile_atr_pct=0.005)  # tight threshold to force VOLATILE
-    candles = volatile_candles(200)
+    candles = volatile_candles(250)            # 250 > EMA-200 + ATR-14 + 1 = 215 minimum
     result = rf.classify(candles)
     assert result == MarketRegime.VOLATILE
 
 
 def test_regime_flat_candles_not_volatile():
     rf = RegimeFilter()
-    candles = flat_candles(200)
+    candles = flat_candles(250)
     result = rf.classify(candles)
     assert result != MarketRegime.VOLATILE
 
 
 def test_regime_strong_uptrend():
     rf = RegimeFilter(volatile_atr_pct=0.05)  # generous threshold so trend is detected
-    candles = trending_candles(200, step=3.0)
+    candles = trending_candles(250, step=3.0)  # 250 > 215 minimum for EMA-200
     result = rf.classify(candles)
     assert result == MarketRegime.TRENDING_UP
 

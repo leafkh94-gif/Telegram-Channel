@@ -21,7 +21,10 @@ TICKER_MAP: dict[str, str] = {
 
 class YahooFinanceFeed(PriceFeed):
     """
-    Fetches 60 days of H1 candles from Yahoo Finance and resamples to H4.
+    Fetches 1 year of H1 candles from Yahoo Finance and resamples to H4.
+    A full year is needed because the H4 regime filter uses EMA-200:
+    US indices only produce ~2 H4 bars per trading day, so 60 days
+    (~120 bars) would never satisfy the 215-bar minimum.
     Pass an epic code (GOLD, US500, US100, US30) or a raw Yahoo ticker.
     """
 
@@ -40,7 +43,7 @@ class YahooFinanceFeed(PriceFeed):
                 time.sleep(random.uniform(2, 5))
                 df = yf.download(
                     self._ticker,
-                    period="60d",
+                    period="1y",   # Yahoo allows 1h interval up to 730d
                     interval="1h",
                     auto_adjust=True,
                     progress=False,

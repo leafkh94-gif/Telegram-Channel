@@ -42,14 +42,48 @@ from strategy.yahoo_feed import YahooFinanceFeed
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 SCAN_INTERVAL_S        = 15 * 60    # seconds between full watchlist scans
+SCAN_ALIGN_OFFSET_S    = 90         # scan this long after each :00/:15/:30/:45 boundary so the just-closed bar is final in the feed
 ALERT_COOLDOWN_S       = 60 * 60    # minimum seconds before re-alerting the same instrument
 HEARTBEAT_INTERVAL_S   = 24 * 60 * 60  # send a liveness ping every 24h if no alerts fired
-TP_ATR_MULT            = 2.5        # take-profit = entry ± (ATR × 2.5)
+TP_ATR_MULT            = 3.0        # take-profit = entry ± (ATR × 3.0) → 2:1 RR with the 1.5 ATR stop
 SL_ATR_MULT            = 1.5        # stop-loss   = entry ± (ATR × 1.5)
 COOLDOWN_FILE          = os.getenv("COOLDOWN_FILE", ".alert_cooldown.json")
-ADX_TRENDING_THRESHOLD = 20         # suppress signals when H4 ADX < this (choppy market)
+ADX_TRENDING_THRESHOLD = 25         # suppress signals when H4 ADX < this; 20-25 is transitional, not a confirmed trend
 NEWS_BLOCK_WINDOW_MIN  = 30         # block alerts within this many minutes of high-impact USD news
 SR_CONFLUENCE_ATR_MULT = 1.0        # entry must be within this × H1 ATR of a key S/R level
+
+# ── Risk-based position sizing ────────────────────────────────────────────────
+# Set ACCOUNT_SIZE_USD in your .env to match your actual account balance.
+# RISK_PER_TRADE_PCT is the fraction of the account risked on each trade (1% default).
+ACCOUNT_SIZE_USD   = float(os.getenv("ACCOUNT_SIZE_USD",  "1000"))
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.01"))
+MIN_LOTS           = 0.01
+MAX_LOTS           = 0.10
+
+# Contract value (USD per 1.0 lot per $1 price move):
+#   Gold (XAUUSD): 100 oz/lot — e.g. 0.05 lots × $15 ATR × 100 = $75 per SL
+#   US indices:    $1/point/lot — e.g. 0.50 lots × 15 pts ATR × 1 = $7.50 per SL
+_CONTRACT_VALUE: dict[str, float] = {
+    "GOLD":  100.0,
+    "US500": 1.0,
+    "US100": 1.0,
+    "US30":  1.0,
+}
+
+
+def _risk_lots(epic: str, sl_distance: float) -> float:
+    """
+    Size the position so that a full stop-loss costs exactly
+    ACCOUNT_SIZE_USD × RISK_PER_TRADE_PCT, capped to [MIN_LOTS, MAX_LOTS].
+
+    lots = risk_usd / (sl_distance × contract_value)
+    """
+    if sl_distance <= 0:
+        return MIN_LOTS
+    contract = _CONTRACT_VALUE.get(epic, 1.0)
+    risk_usd = ACCOUNT_SIZE_USD * RISK_PER_TRADE_PCT
+    lots = risk_usd / (sl_distance * contract)
+    return max(MIN_LOTS, min(lots, MAX_LOTS))
 
 
 @dataclass
@@ -101,6 +135,27 @@ def _save_cooldown(instr) -> None:
         logging.getLogger(__name__).warning("Could not save cooldown state: %s", exc)
 
 
+# ── Scan timing ───────────────────────────────────────────────────────────────
+
+def _sleep_until_next_scan(logger: logging.Logger) -> None:
+    """
+    Sleep until SCAN_ALIGN_OFFSET_S past the next SCAN_INTERVAL_S boundary
+    (:00 / :15 / :30 / :45 UTC). A free-running sleep drifts, so scans land at
+    random points mid-candle; aligning to boundaries guarantees the scan right
+    after every H1 close (both :00- and :30-aligned bars) sees the completed
+    candle within ~90 s instead of up to 15 min late.
+    Sleeps in 1 s slices so SIGTERM/SIGINT still shut down promptly.
+    """
+    now = time.time()
+    next_boundary = (int(now) // SCAN_INTERVAL_S + 1) * SCAN_INTERVAL_S
+    target = next_boundary + SCAN_ALIGN_OFFSET_S
+    if target - now < 60:   # woke just before a boundary — take the next slot
+        target += SCAN_INTERVAL_S
+    logger.debug("Scan complete — sleeping %.0fs until next aligned scan", target - now)
+    while _running and time.time() < target:
+        time.sleep(1)
+
+
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 _running = True
@@ -115,7 +170,7 @@ def _handle_shutdown(sig, frame):  # noqa: ARG001
 # ── Alert formatting ──────────────────────────────────────────────────────────
 
 def _build_message(instr: _Instrument, direction: str,
-                   entry: float, tp: float, sl: float) -> tuple[str, str]:
+                   entry: float, tp: float, sl: float, lots: float) -> tuple[str, str]:
     """Return (html, plain) alert strings."""
     import datetime
     now       = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -136,6 +191,7 @@ def _build_message(instr: _Instrument, direction: str,
         f"Take Profit:  <b>{tp:,.2f}</b>  (+{tp_pct:.1f}%)",
         f"Stop Loss:    <b>{sl:,.2f}</b>  (-{sl_pct:.1f}%)",
         f"R:R Ratio:    1 : {rr:.1f}",
+        f"Size:         <b>{lots:.2f} lots</b>  (1% risk on ${ACCOUNT_SIZE_USD:,.0f} account)",
         "",
         "<i>Alert only — always confirm before trading.</i>",
     ]
@@ -193,7 +249,7 @@ def _evaluate_one(instr: _Instrument, feed: YahooFinanceFeed,
       1. Cooldown         — skip if already alerted recently
       2. Market hours     — skip outside trading session
       3. News window      — skip ±30 min around high-impact USD events
-      4. ADX regime       — skip when H4 ADX < 20 (choppy/ranging market)
+      4. ADX regime       — skip when H4 ADX < 25 (choppy/ranging market)
       5. Strategy signal  — liquidity sweep + EMA regime
       6. S/R confluence   — skip if entry is not near a key price level
     """
@@ -275,20 +331,23 @@ def _send_alert(instr: _Instrument, candles, direction: str,
 
         current_atr = valid_atr[-1]
         entry       = h1[-1].close
+        sl_distance = SL_ATR_MULT * current_atr
 
         if direction == "buy":
             tp = entry + TP_ATR_MULT * current_atr
-            sl = entry - SL_ATR_MULT * current_atr
+            sl = entry - sl_distance
         else:
             tp = entry - TP_ATR_MULT * current_atr
-            sl = entry + SL_ATR_MULT * current_atr
+            sl = entry + sl_distance
 
-        html, plain = _build_message(instr, direction, entry, tp, sl)
+        lots = _risk_lots(instr.epic, sl_distance)
+
+        html, plain = _build_message(instr, direction, entry, tp, sl, lots)
         _notify(notifier, html, plain)
         instr.mark_alerted()
         _save_cooldown(instr)
-        logger.info("Alert sent: %s %s  entry=%.2f  tp=%.2f  sl=%.2f  atr=%.2f",
-                    instr.epic, direction.upper(), entry, tp, sl, current_atr)
+        logger.info("Alert sent: %s %s  entry=%.2f  tp=%.2f  sl=%.2f  lots=%.2f  atr=%.2f",
+                    instr.epic, direction.upper(), entry, tp, sl, lots, current_atr)
     except Exception as exc:
         logger.error("%s: alert error: %s", instr.epic, exc)
 
@@ -400,8 +459,7 @@ def main() -> None:
             break
 
         if _running:
-            logger.debug("Scan complete — sleeping %ds", SCAN_INTERVAL_S)
-            time.sleep(SCAN_INTERVAL_S)
+            _sleep_until_next_scan(logger)
 
     logger.info("Alert bot stopped cleanly.")
 
