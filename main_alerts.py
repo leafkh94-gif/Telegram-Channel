@@ -41,7 +41,7 @@ from strategy.yahoo_feed import YahooFinanceFeed
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SCAN_INTERVAL_S        = 30 * 60    # seconds between full watchlist scans
+SCAN_INTERVAL_S        = 15 * 60    # seconds between full watchlist scans
 ALERT_COOLDOWN_S       = 60 * 60    # minimum seconds before re-alerting the same instrument
 HEARTBEAT_INTERVAL_S   = 24 * 60 * 60  # send a liveness ping every 24h if no alerts fired
 TP_ATR_MULT            = 2.5        # take-profit = entry ± (ATR × 2.5)
@@ -346,8 +346,8 @@ def main() -> None:
     _startup_time = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     _notify(notifier,
             f"🟡 <b>Alert bot started</b> — <i>{_startup_time}</i>\n"
-            "Watching Gold, S&amp;P 500, Nasdaq 100, Dow Jones. Scanning every 30 min.",
-            f"Alert bot started {_startup_time}. Watching Gold, S&P 500, Nasdaq, Dow. Scanning every 30 min.")
+            "Watching Gold, S&amp;P 500, Nasdaq 100, Dow Jones. Scanning every 15 min.",
+            f"Alert bot started {_startup_time}. Watching Gold, S&P 500, Nasdaq, Dow. Scanning every 15 min.")
     logger.info("Startup notification sent")
 
     strategy  = GoldStrategy()
