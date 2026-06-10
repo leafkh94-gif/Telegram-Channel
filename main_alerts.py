@@ -2,8 +2,14 @@
 main_alerts.py — multi-market alert bot (no execution, no broker login).
 
 Watches Gold, S&P 500, Nasdaq 100, and Dow Jones via Yahoo Finance (free).
-When GoldStrategy detects a setup it sends a Telegram message with
-entry price, take profit, and stop loss — no trades are placed.
+When the multi-agent Orchestrator detects a high-quality setup it sends a
+Telegram message with entry price, take profit, stop loss, and agent reasoning.
+
+Signal pipeline:
+  MarketAgent  — ADX regime + liquidity sweep + S/R confluence
+  NewsAgent    — ForexFactory calendar + RSS breaking headlines
+  RiskAgent    — ATR-based lot sizing
+  Orchestrator — combines all three; fires only when all agree
 
 Usage:
   python main_alerts.py
@@ -12,11 +18,14 @@ Required .env keys:
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
 
+Optional .env keys:
+  ACCOUNT_SIZE_USD      (default 2000)
+  RISK_PER_TRADE_PCT    (default 0.01 = 1%)
+
 No Capital.com or TradingView account required.
 """
 import json
 import logging
-import math
 import os
 import signal
 import sys
@@ -29,61 +38,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from agents.orchestrator import Orchestrator
+from agents.base import TradeDecision
 from alerts.notifier import NullNotifier, TelegramNotifier
 from core.log_sanitizer import setup_logging
-from strategy.base import TF_H1, TF_H4
-from strategy.gold_strategy import GoldStrategy
-from strategy.indicators import atr as _atr, adx as _adx
+from strategy.base import TF_H1
+from strategy.indicators import atr as _atr
 from strategy.market_hours import is_tradeable
-from strategy.news_filter import high_impact_news_within
-from strategy.sr_levels import key_levels, near_key_level
 from strategy.yahoo_feed import YahooFinanceFeed
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SCAN_INTERVAL_S        = 15 * 60    # seconds between full watchlist scans
-SCAN_ALIGN_OFFSET_S    = 90         # scan this long after each :00/:15/:30/:45 boundary so the just-closed bar is final in the feed
-ALERT_COOLDOWN_S       = 60 * 60    # minimum seconds before re-alerting the same instrument
-HEARTBEAT_INTERVAL_S   = 24 * 60 * 60  # send a liveness ping every 24h if no alerts fired
-TP_ATR_MULT            = 3.0        # take-profit = entry ± (ATR × 3.0) → 2:1 RR with the 1.5 ATR stop
-SL_ATR_MULT            = 1.5        # stop-loss   = entry ± (ATR × 1.5)
-COOLDOWN_FILE          = os.getenv("COOLDOWN_FILE", ".alert_cooldown.json")
-ADX_TRENDING_THRESHOLD = 25         # suppress signals when H4 ADX < this; 20-25 is transitional, not a confirmed trend
-NEWS_BLOCK_WINDOW_MIN  = 30         # block alerts within this many minutes of high-impact USD news
-SR_CONFLUENCE_ATR_MULT = 1.0        # entry must be within this × H1 ATR of a key S/R level
-
-# ── Risk-based position sizing ────────────────────────────────────────────────
-# Set ACCOUNT_SIZE_USD in your .env to match your actual account balance.
-# RISK_PER_TRADE_PCT is the fraction of the account risked on each trade (1% default).
-ACCOUNT_SIZE_USD   = float(os.getenv("ACCOUNT_SIZE_USD",  "2000"))
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.01"))
-MIN_LOTS           = 0.01
-MAX_LOTS           = 0.10
-
-# Contract value (USD per 1.0 lot per $1 price move):
-#   Gold (XAUUSD): 100 oz/lot — e.g. 0.05 lots × $15 ATR × 100 = $75 per SL
-#   US indices:    $1/point/lot — e.g. 0.50 lots × 15 pts ATR × 1 = $7.50 per SL
-_CONTRACT_VALUE: dict[str, float] = {
-    "GOLD":  100.0,
-    "US500": 1.0,
-    "US100": 1.0,
-    "US30":  1.0,
-}
-
-
-def _risk_lots(epic: str, sl_distance: float) -> float:
-    """
-    Size the position so that a full stop-loss costs exactly
-    ACCOUNT_SIZE_USD × RISK_PER_TRADE_PCT, capped to [MIN_LOTS, MAX_LOTS].
-
-    lots = risk_usd / (sl_distance × contract_value)
-    """
-    if sl_distance <= 0:
-        return MIN_LOTS
-    contract = _CONTRACT_VALUE.get(epic, 1.0)
-    risk_usd = ACCOUNT_SIZE_USD * RISK_PER_TRADE_PCT
-    lots = risk_usd / (sl_distance * contract)
-    return max(MIN_LOTS, min(lots, MAX_LOTS))
+SCAN_INTERVAL_S      = 15 * 60        # seconds between full watchlist scans
+SCAN_ALIGN_OFFSET_S  = 90             # seconds after each :00/:15/:30/:45 boundary
+ALERT_COOLDOWN_S     = 60 * 60        # minimum seconds before re-alerting same instrument
+HEARTBEAT_INTERVAL_S = 24 * 60 * 60   # liveness ping every 24h if no alerts fired
+TP_ATR_MULT          = 3.0            # take-profit = entry ± (ATR × 3.0)
+SL_ATR_MULT          = 1.5            # stop-loss   = entry ± (ATR × 1.5)
+COOLDOWN_FILE        = os.getenv("COOLDOWN_FILE", ".alert_cooldown.json")
+ACCOUNT_SIZE_USD     = float(os.getenv("ACCOUNT_SIZE_USD", "2000"))
 
 
 @dataclass
@@ -106,7 +79,7 @@ WATCHLIST: list[_Instrument] = [
     _Instrument("US30",  "Dow Jones (US30)"),
 ]
 
-# ── Cooldown persistence ─────────────────────────────────────────────────────
+# ── Cooldown persistence ──────────────────────────────────────────────────────
 
 def _load_cooldowns(instruments: list) -> None:
     try:
@@ -139,19 +112,17 @@ def _save_cooldown(instr) -> None:
 
 def _sleep_until_next_scan(logger: logging.Logger) -> None:
     """
-    Sleep until SCAN_ALIGN_OFFSET_S past the next SCAN_INTERVAL_S boundary
-    (:00 / :15 / :30 / :45 UTC). A free-running sleep drifts, so scans land at
-    random points mid-candle; aligning to boundaries guarantees the scan right
-    after every H1 close (both :00- and :30-aligned bars) sees the completed
-    candle within ~90 s instead of up to 15 min late.
+    Sleep until SCAN_ALIGN_OFFSET_S past the next SCAN_INTERVAL_S boundary.
+    Aligning to :00/:15/:30/:45 UTC guarantees scans see completed H1 candles
+    rather than landing at a random mid-candle point.
     Sleeps in 1 s slices so SIGTERM/SIGINT still shut down promptly.
     """
     now = time.time()
     next_boundary = (int(now) // SCAN_INTERVAL_S + 1) * SCAN_INTERVAL_S
     target = next_boundary + SCAN_ALIGN_OFFSET_S
-    if target - now < 60:   # woke just before a boundary — take the next slot
+    if target - now < 60:
         target += SCAN_INTERVAL_S
-    logger.debug("Scan complete — sleeping %.0fs until next aligned scan", target - now)
+    logger.debug("Sleeping %.0fs until next aligned scan", target - now)
     while _running and time.time() < target:
         time.sleep(1)
 
@@ -169,18 +140,27 @@ def _handle_shutdown(sig, frame):  # noqa: ARG001
 
 # ── Alert formatting ──────────────────────────────────────────────────────────
 
-def _build_message(instr: _Instrument, direction: str,
-                   entry: float, tp: float, sl: float, lots: float) -> tuple[str, str]:
-    """Return (html, plain) alert strings."""
+def _build_message(instr: _Instrument, decision: TradeDecision,
+                   entry: float, tp: float, sl: float) -> tuple[str, str]:
+    """Return (html, plain) alert strings including per-agent reasoning."""
     import datetime
     now       = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    emoji     = "🟢" if direction == "buy" else "🔴"
-    dir_label = "BUY"  if direction == "buy" else "SELL"
+    emoji     = "🟢" if decision.action == "buy" else "🔴"
+    dir_label = "BUY" if decision.action == "buy" else "SELL"
     risk      = abs(entry - sl)
     reward    = abs(entry - tp)
     rr        = reward / risk if risk > 0 else 0.0
     tp_pct    = (reward / entry) * 100
     sl_pct    = (risk   / entry) * 100
+
+    # Agent verdict lines
+    verdict_lines = []
+    for v in decision.verdicts:
+        verdict_lines.append(
+            f"{v.emoji()} <b>{v.agent.capitalize():<7}</b> {v.reason}  "
+            f"[{v.confidence:.0%}]"
+        )
+    verdict_block = "\n".join(verdict_lines) if verdict_lines else "n/a"
 
     html_lines = [
         f"{emoji} <b>TRADE SETUP — {instr.name}</b>",
@@ -191,7 +171,11 @@ def _build_message(instr: _Instrument, direction: str,
         f"Take Profit:  <b>{tp:,.2f}</b>  (+{tp_pct:.1f}%)",
         f"Stop Loss:    <b>{sl:,.2f}</b>  (-{sl_pct:.1f}%)",
         f"R:R Ratio:    1 : {rr:.1f}",
-        f"Size:         <b>{lots:.2f} lots</b>  (1% risk on ${ACCOUNT_SIZE_USD:,.0f} account)",
+        f"Size:         <b>{decision.lots:.2f} lots</b>  "
+        f"(1% risk on ${ACCOUNT_SIZE_USD:,.0f})",
+        "",
+        f"📊 <b>Agent Analysis:</b>",
+        verdict_block,
         "",
         "<i>Alert only — always confirm before trading.</i>",
     ]
@@ -214,11 +198,9 @@ _last_heartbeat: float = 0.0
 
 
 def _maybe_send_heartbeat(notifier, instruments: list, logger: logging.Logger) -> None:
-    """Send a 24h liveness ping only when no trade alert has fired recently."""
     global _last_heartbeat
     if time.time() - _last_heartbeat < HEARTBEAT_INTERVAL_S:
         return
-    # Skip heartbeat if a real alert fired in the last 24h — not needed
     if any(time.time() - i._last_alert < HEARTBEAT_INTERVAL_S for i in instruments):
         _last_heartbeat = time.time()
         return
@@ -239,19 +221,20 @@ _US_INDEX_EPICS = frozenset({"US500", "US100", "US30"})
 # ── Per-instrument scan ───────────────────────────────────────────────────────
 
 def _evaluate_one(instr: _Instrument, feed: YahooFinanceFeed,
-                  strategy: GoldStrategy, logger: logging.Logger):
+                  orchestrator: Orchestrator,
+                  logger: logging.Logger):
     """
-    Fetch candles and evaluate strategy through a four-gate filter pipeline.
-    Returns (candles, direction) if all gates pass, else None.
-    Does NOT send an alert — caller decides after consensus check.
+    Pre-flight checks, then delegate to Orchestrator.
+    Returns (candles, TradeDecision) if a signal is approved, else None.
 
-    Gate order (cheapest/fastest checks first):
-      1. Cooldown         — skip if already alerted recently
-      2. Market hours     — skip outside trading session
-      3. News window      — skip ±30 min around high-impact USD events
-      4. ADX regime       — skip when H4 ADX < 25 (choppy/ranging market)
-      5. Strategy signal  — liquidity sweep + EMA regime
-      6. S/R confluence   — skip if entry is not near a key price level
+    Pre-flight (before fetching data — cheap):
+      1. Cooldown  — skip if already alerted within ALERT_COOLDOWN_S
+      2. Hours     — skip outside the instrument's trading session
+
+    Orchestrator (after fetching candles):
+      3. MarketAgent  — ADX + liquidity sweep + S/R confluence
+      4. NewsAgent    — ForexFactory calendar + RSS breaking headlines
+      5. RiskAgent    — lot sizing; blocks if ATR too large for account
     """
     if instr.on_cooldown():
         logger.debug("%s: cooldown active — skipping", instr.epic)
@@ -261,93 +244,48 @@ def _evaluate_one(instr: _Instrument, feed: YahooFinanceFeed,
         logger.info("%s: outside trading hours — skipping", instr.epic)
         return None
 
-    if high_impact_news_within(NEWS_BLOCK_WINDOW_MIN):
-        logger.info("%s: high-impact USD news within %dm — skipping",
-                    instr.epic, NEWS_BLOCK_WINDOW_MIN)
-        return None
-
     try:
-        candles = feed.get_candles()
-        h1 = candles.get(TF_H1, [])
-        h4 = candles.get(TF_H4, [])
-
-        if not h1:
-            logger.debug("%s: no H1 candles returned", instr.epic)
+        candles  = feed.get_candles()
+        decision = orchestrator.decide(instr.epic, candles)
+        if decision.action == "skip":
+            logger.debug("%s: orchestrator skip — %s", instr.epic, decision.reason)
             return None
-
-        # Gate 4 — ADX: suppress signals in choppy/ranging H4 conditions
-        if h4:
-            adx_vals = _adx(h4, period=14)
-            valid_adx = [v for v in adx_vals if not math.isnan(v)]
-            if valid_adx:
-                last_adx = valid_adx[-1]
-                if last_adx < ADX_TRENDING_THRESHOLD:
-                    logger.info("%s: ADX %.1f < %d — choppy market, skipping",
-                                instr.epic, last_adx, ADX_TRENDING_THRESHOLD)
-                    return None
-                logger.debug("%s: ADX %.1f — trending, proceeding", instr.epic, last_adx)
-
-        # Gate 5 — Strategy signal
-        sig = strategy.evaluate(candles)
-        if sig is None:
-            logger.debug("%s: no signal", instr.epic)
-            return None
-
-        # Gate 6 — S/R confluence: entry should be near a significant level
-        if h4 and h1:
-            atr_series = _atr(h1, period=14)
-            valid_atr  = [v for v in atr_series if v == v]
-            if valid_atr:
-                current_atr = valid_atr[-1]
-                entry       = h1[-1].close
-                levels      = key_levels(h4, h1)
-                if not near_key_level(entry, levels, current_atr, SR_CONFLUENCE_ATR_MULT):
-                    nearest = min(levels, key=lambda lv: abs(entry - lv)) if levels else None
-                    dist    = abs(entry - nearest) if nearest is not None else float("inf")
-                    logger.info(
-                        "%s: entry %.2f not near key level "
-                        "(nearest %.2f, dist %.1f vs threshold %.1f) — skipping",
-                        instr.epic, entry,
-                        nearest or 0, dist, SR_CONFLUENCE_ATR_MULT * current_atr,
-                    )
-                    return None
-
-        return candles, sig.direction
+        return candles, decision
     except Exception as exc:
         logger.error("%s: evaluation error: %s", instr.epic, exc)
         return None
 
 
-def _send_alert(instr: _Instrument, candles, direction: str,
+def _send_alert(instr: _Instrument, candles: dict, decision: TradeDecision,
                 notifier, logger: logging.Logger) -> None:
-    """Calculate ATR-based TP/SL and send the Telegram alert."""
+    """Compute ATR-based TP/SL and send the Telegram alert."""
     try:
-        h1 = candles.get(TF_H1, [])
+        h1         = candles.get(TF_H1, [])
         atr_series = _atr(h1, period=14)
-        valid_atr  = [v for v in atr_series if v == v]   # strip leading NaN
+        valid_atr  = [v for v in atr_series if v == v]
         if not valid_atr:
             logger.warning("%s: ATR unavailable — skipping alert", instr.epic)
             return
 
         current_atr = valid_atr[-1]
         entry       = h1[-1].close
-        sl_distance = SL_ATR_MULT * current_atr
 
-        if direction == "buy":
+        if decision.action == "buy":
             tp = entry + TP_ATR_MULT * current_atr
-            sl = entry - sl_distance
+            sl = entry - SL_ATR_MULT * current_atr
         else:
             tp = entry - TP_ATR_MULT * current_atr
-            sl = entry + sl_distance
+            sl = entry + SL_ATR_MULT * current_atr
 
-        lots = _risk_lots(instr.epic, sl_distance)
-
-        html, plain = _build_message(instr, direction, entry, tp, sl, lots)
+        html, plain = _build_message(instr, decision, entry, tp, sl)
         _notify(notifier, html, plain)
         instr.mark_alerted()
         _save_cooldown(instr)
-        logger.info("Alert sent: %s %s  entry=%.2f  tp=%.2f  sl=%.2f  lots=%.2f  atr=%.2f",
-                    instr.epic, direction.upper(), entry, tp, sl, lots, current_atr)
+        logger.info(
+            "Alert sent: %s %s  entry=%.2f  tp=%.2f  sl=%.2f  lots=%.2f  conf=%.0f%%",
+            instr.epic, decision.action.upper(),
+            entry, tp, sl, decision.lots, decision.confidence * 100,
+        )
     except Exception as exc:
         logger.error("%s: alert error: %s", instr.epic, exc)
 
@@ -359,7 +297,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, *args): pass  # silence access logs
+    def log_message(self, *args): pass
 
 
 def _start_health_server() -> None:
@@ -389,31 +327,29 @@ def main() -> None:
     else:
         notifier = NullNotifier()
         logger.warning(
-            "No Telegram credentials found — alerts will be logged only.\n"
+            "No Telegram credentials — alerts will be logged only.\n"
             "Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to your .env file."
         )
 
-    # One feed per instrument (Yahoo Finance — no auth required)
     feeds: dict[str, YahooFinanceFeed] = {
         instr.epic: YahooFinanceFeed(instr.epic) for instr in WATCHLIST
     }
 
     _load_cooldowns(WATCHLIST)
+    orchestrator = Orchestrator()
 
-    # Startup confirmation — lets you know the cloud run picked up cleanly
     import datetime as _dt
     _startup_time = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    _notify(notifier,
-            f"🟡 <b>Alert bot started</b> — <i>{_startup_time}</i>\n"
-            "Watching Gold, S&amp;P 500, Nasdaq 100, Dow Jones. Scanning every 15 min.",
-            f"Alert bot started {_startup_time}. Watching Gold, S&P 500, Nasdaq, Dow. Scanning every 15 min.")
+    _notify(
+        notifier,
+        f"🟡 <b>Alert bot started</b> — <i>{_startup_time}</i>\n"
+        "Watching Gold, S&amp;P 500, Nasdaq 100, Dow Jones. "
+        "Multi-agent system active. Scanning every 15 min.",
+        f"Alert bot started {_startup_time}. Multi-agent system active. Scanning every 15 min.",
+    )
     logger.info("Startup notification sent")
 
-    strategy  = GoldStrategy()
-    epic_list = ", ".join(i.epic for i in WATCHLIST)
-
-    # Optional bounded runtime (used by the cloud runner so each job exits
-    # cleanly and the next queued run takes over). 0/unset = run forever.
+    epic_list     = ", ".join(i.epic for i in WATCHLIST)
     max_runtime_s = int(os.getenv("MAX_RUNTIME_S", "0"))
     start_time    = time.time()
 
@@ -422,35 +358,36 @@ def main() -> None:
                 f", max runtime {max_runtime_s}s" if max_runtime_s else "")
 
     while _running:
-        # ── Phase 1: evaluate every instrument, collect pending signals ────────
-        pending: dict[str, tuple] = {}   # epic -> (instr, candles, direction)
+        # ── Phase 1: evaluate each instrument ────────────────────────────────
+        pending: dict[str, tuple] = {}   # epic -> (instr, candles, decision)
         for instr in WATCHLIST:
             if not _running:
                 break
-            result = _evaluate_one(instr, feeds[instr.epic], strategy, logger)
+            result = _evaluate_one(instr, feeds[instr.epic], orchestrator, logger)
             if result is not None:
-                candles, direction = result
-                pending[instr.epic] = (instr, candles, direction)
+                candles, decision = result
+                pending[instr.epic] = (instr, candles, decision)
             time.sleep(3)   # stagger requests to avoid Yahoo Finance rate limits
 
-        # ── Phase 2: US index consensus — suppress the lone contradicting signal
+        # ── Phase 2: US index consensus — suppress lone contradicting signal ─
         us_pending = {e: v for e, v in pending.items() if e in _US_INDEX_EPICS}
         if len(us_pending) >= 2:
-            buy_count  = sum(1 for _, _, d in us_pending.values() if d == "buy")
-            sell_count = sum(1 for _, _, d in us_pending.values() if d == "sell")
-            if buy_count != sell_count:   # tie → no consensus, send both
+            buy_count  = sum(1 for _, _, d in us_pending.values() if d.action == "buy")
+            sell_count = sum(1 for _, _, d in us_pending.values() if d.action == "sell")
+            if buy_count != sell_count:
                 consensus = "buy" if buy_count > sell_count else "sell"
                 for epic in list(pending.keys()):
-                    if epic in _US_INDEX_EPICS and pending[epic][2] != consensus:
+                    if epic in _US_INDEX_EPICS and pending[epic][2].action != consensus:
                         logger.info(
                             "%s: suppressed — contradicts US index consensus "
-                            "(%d buy / %d sell → %s)", epic, buy_count, sell_count, consensus
+                            "(%d buy / %d sell → %s)",
+                            epic, buy_count, sell_count, consensus,
                         )
                         del pending[epic]
 
         # ── Phase 3: send all approved alerts ────────────────────────────────
-        for epic, (instr, candles, direction) in pending.items():
-            _send_alert(instr, candles, direction, notifier, logger)
+        for epic, (instr, candles, decision) in pending.items():
+            _send_alert(instr, candles, decision, notifier, logger)
 
         _maybe_send_heartbeat(notifier, WATCHLIST, logger)
 
