@@ -194,6 +194,12 @@ def _build_message(instr: _Instrument, decision: TradeDecision,
     tp_pct    = (reward / entry) * 100
     sl_pct    = (risk   / entry) * 100
 
+    # For BUY:  TP is above entry (+), SL is below entry (-)
+    # For SELL: TP is below entry (-), SL is above entry (+)
+    is_buy    = decision.action == "buy"
+    tp_sign   = "+" if is_buy else "-"
+    sl_sign   = "-" if is_buy else "+"
+
     # Agent verdict lines
     verdict_lines = []
     for v in decision.verdicts:
@@ -209,8 +215,8 @@ def _build_message(instr: _Instrument, decision: TradeDecision,
         "",
         f"Direction:    <b>{dir_label}</b>",
         f"Entry:        <b>{entry:,.2f}</b>",
-        f"Take Profit:  <b>{tp:,.2f}</b>  (+{tp_pct:.1f}%)",
-        f"Stop Loss:    <b>{sl:,.2f}</b>  (-{sl_pct:.1f}%)",
+        f"Take Profit:  <b>{tp:,.2f}</b>  ({tp_sign}{tp_pct:.1f}%)",
+        f"Stop Loss:    <b>{sl:,.2f}</b>  ({sl_sign}{sl_pct:.1f}%)",
         f"R:R Ratio:    1 : {rr:.1f}",
         f"Size:         <b>{decision.lots:.2f} lots</b>  "
         f"(1% risk on ${ACCOUNT_SIZE_USD:,.0f})",
