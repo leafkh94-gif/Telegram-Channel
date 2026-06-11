@@ -94,6 +94,7 @@ WATCHLIST: list[_Instrument] = [
 # ── Cooldown persistence ──────────────────────────────────────────────────────
 
 def _load_cooldowns(instruments: list) -> None:
+    global _last_heartbeat
     try:
         with open(COOLDOWN_FILE) as f:
             data = json.load(f)
@@ -101,6 +102,9 @@ def _load_cooldowns(instruments: list) -> None:
             ts = data.get(instr.epic, 0.0)
             if ts:
                 instr._last_alert = float(ts)
+            instr._scans_done    = int(data.get(f"{instr.epic}_scans",   0))
+            instr._scans_skipped = int(data.get(f"{instr.epic}_skipped", 0))
+        _last_heartbeat = float(data.get("_last_heartbeat", 0.0))
         logging.getLogger(__name__).info("Cooldown state restored from %s", COOLDOWN_FILE)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
@@ -113,11 +117,30 @@ def _save_cooldown(instr) -> None:
                 data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             data = {}
-        data[instr.epic] = instr._last_alert
+        data[instr.epic]              = instr._last_alert
+        data[f"{instr.epic}_scans"]   = instr._scans_done
+        data[f"{instr.epic}_skipped"] = instr._scans_skipped
         with open(COOLDOWN_FILE, "w") as f:
             json.dump(data, f)
     except OSError as exc:
         logging.getLogger(__name__).warning("Could not save cooldown state: %s", exc)
+
+
+def _save_scan_counters(instruments: list) -> None:
+    """Persist scan/skip counters after every loop so they survive runner restarts."""
+    try:
+        try:
+            with open(COOLDOWN_FILE) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        for instr in instruments:
+            data[f"{instr.epic}_scans"]   = instr._scans_done
+            data[f"{instr.epic}_skipped"] = instr._scans_skipped
+        with open(COOLDOWN_FILE, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
 
 
 # ── Scan timing ───────────────────────────────────────────────────────────────
@@ -223,9 +246,9 @@ def _maybe_send_heartbeat(notifier, instruments: list, logger: logging.Logger) -
         skipped  = instr._scans_skipped
         if skipped > 0 and scanned == 0:
             if instr.epic in {"US500", "US100", "US30"}:
-                note = f"outside NYSE hours all day (open Mon–Fri 9:30–15:30 ET)"
+                note = "outside NYSE hours (open Mon–Fri 9:30–15:30 ET)"
             else:
-                note = f"outside trading session all day"
+                note = "outside trading session"
         elif scanned > 0:
             note = f"scanned {scanned}× — no setup found"
         else:
@@ -240,6 +263,18 @@ def _maybe_send_heartbeat(notifier, instruments: list, logger: logging.Logger) -
     plain = html.replace("<b>", "").replace("</b>", "")
     _notify(notifier, html, plain)
     _last_heartbeat = time.time()
+    # persist heartbeat timestamp so it survives runner restarts
+    try:
+        try:
+            with open(COOLDOWN_FILE) as f:
+                _cd = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _cd = {}
+        _cd["_last_heartbeat"] = _last_heartbeat
+        with open(COOLDOWN_FILE, "w") as f:
+            json.dump(_cd, f)
+    except OSError:
+        pass
     logger.info("Daily heartbeat sent")
 
 
@@ -421,6 +456,9 @@ def main() -> None:
             _send_alert(instr, candles, decision, notifier, logger)
 
         _maybe_send_heartbeat(notifier, WATCHLIST, logger)
+
+        # ── Phase 4: persist scan counters so they survive runner restarts ────
+        _save_scan_counters(WATCHLIST)
 
         if max_runtime_s and (time.time() - start_time) >= max_runtime_s:
             logger.info("Max runtime reached — exiting cleanly for handoff.")
