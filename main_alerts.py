@@ -63,13 +63,25 @@ ACCOUNT_SIZE_USD     = float(os.getenv("ACCOUNT_SIZE_USD", "2000"))
 class _Instrument:
     epic: str
     name: str
-    _last_alert: float = field(default=0.0, init=False, repr=False)
+    _last_alert: float  = field(default=0.0, init=False, repr=False)
+    _scans_done: int    = field(default=0,   init=False, repr=False)
+    _scans_skipped: int = field(default=0,   init=False, repr=False)
 
     def on_cooldown(self) -> bool:
         return time.time() - self._last_alert < ALERT_COOLDOWN_S
 
     def mark_alerted(self) -> None:
         self._last_alert = time.time()
+
+    def record_scan(self) -> None:
+        self._scans_done += 1
+
+    def record_skip(self) -> None:
+        self._scans_skipped += 1
+
+    def reset_counters(self) -> None:
+        self._scans_done    = 0
+        self._scans_skipped = 0
 
 
 WATCHLIST: list[_Instrument] = [
@@ -204,11 +216,28 @@ def _maybe_send_heartbeat(notifier, instruments: list, logger: logging.Logger) -
     if any(time.time() - i._last_alert < HEARTBEAT_INTERVAL_S for i in instruments):
         _last_heartbeat = time.time()
         return
-    markets = ", ".join(i.name for i in instruments)
+
+    status_lines = []
+    for instr in instruments:
+        scanned  = instr._scans_done
+        skipped  = instr._scans_skipped
+        if skipped > 0 and scanned == 0:
+            if instr.epic in {"US500", "US100", "US30"}:
+                note = f"outside NYSE hours all day (open Mon–Fri 9:30–15:30 ET)"
+            else:
+                note = f"outside trading session all day"
+        elif scanned > 0:
+            note = f"scanned {scanned}× — no setup found"
+        else:
+            note = "no data yet"
+        status_lines.append(f"  • <b>{instr.name}</b>: {note}")
+        instr.reset_counters()
+
+    status_block = "\n".join(status_lines)
     html  = ("🤖 <b>Alert bot — daily check-in</b>\n"
-             f"<i>Watching: {markets}</i>\n"
-             "No trade setups in the last 24h — bot is running normally.")
-    plain = f"Alert bot — daily check-in. Watching {markets}. No setups in 24h."
+             "No trade setups detected in the last 24h.\n\n"
+             f"<b>Last 24h per instrument:</b>\n{status_block}")
+    plain = html.replace("<b>", "").replace("</b>", "")
     _notify(notifier, html, plain)
     _last_heartbeat = time.time()
     logger.info("Daily heartbeat sent")
@@ -242,11 +271,13 @@ def _evaluate_one(instr: _Instrument, feed: YahooFinanceFeed,
 
     if not is_tradeable(instr.epic):
         logger.info("%s: outside trading hours — skipping", instr.epic)
+        instr.record_skip()
         return None
 
     try:
         candles  = feed.get_candles()
         decision = orchestrator.decide(instr.epic, candles)
+        instr.record_scan()
         if decision.action == "skip":
             logger.debug("%s: orchestrator skip — %s", instr.epic, decision.reason)
             return None
