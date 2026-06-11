@@ -63,9 +63,10 @@ ACCOUNT_SIZE_USD     = float(os.getenv("ACCOUNT_SIZE_USD", "2000"))
 class _Instrument:
     epic: str
     name: str
-    _last_alert: float  = field(default=0.0, init=False, repr=False)
-    _scans_done: int    = field(default=0,   init=False, repr=False)
-    _scans_skipped: int = field(default=0,   init=False, repr=False)
+    _last_alert: float   = field(default=0.0, init=False, repr=False)
+    _scans_done: int     = field(default=0,   init=False, repr=False)
+    _scans_skipped: int  = field(default=0,   init=False, repr=False)
+    _last_block: str     = field(default="",  init=False, repr=False)
 
     def on_cooldown(self) -> bool:
         return time.time() - self._last_alert < ALERT_COOLDOWN_S
@@ -73,8 +74,10 @@ class _Instrument:
     def mark_alerted(self) -> None:
         self._last_alert = time.time()
 
-    def record_scan(self) -> None:
+    def record_scan(self, block_reason: str = "") -> None:
         self._scans_done += 1
+        if block_reason:
+            self._last_block = block_reason
 
     def record_skip(self) -> None:
         self._scans_skipped += 1
@@ -82,6 +85,7 @@ class _Instrument:
     def reset_counters(self) -> None:
         self._scans_done    = 0
         self._scans_skipped = 0
+        self._last_block    = ""
 
 
 WATCHLIST: list[_Instrument] = [
@@ -104,6 +108,7 @@ def _load_cooldowns(instruments: list) -> None:
                 instr._last_alert = float(ts)
             instr._scans_done    = int(data.get(f"{instr.epic}_scans",   0))
             instr._scans_skipped = int(data.get(f"{instr.epic}_skipped", 0))
+            instr._last_block    = str(data.get(f"{instr.epic}_block",   ""))
         _last_heartbeat = float(data.get("_last_heartbeat", 0.0))
         logging.getLogger(__name__).info("Cooldown state restored from %s", COOLDOWN_FILE)
     except (FileNotFoundError, json.JSONDecodeError):
@@ -137,6 +142,7 @@ def _save_scan_counters(instruments: list) -> None:
         for instr in instruments:
             data[f"{instr.epic}_scans"]   = instr._scans_done
             data[f"{instr.epic}_skipped"] = instr._scans_skipped
+            data[f"{instr.epic}_block"]   = instr._last_block
         with open(COOLDOWN_FILE, "w") as f:
             json.dump(data, f)
     except OSError:
@@ -250,7 +256,8 @@ def _maybe_send_heartbeat(notifier, instruments: list, logger: logging.Logger) -
             else:
                 note = "outside trading session"
         elif scanned > 0:
-            note = f"scanned {scanned}× — no setup found"
+            block = f" ({instr._last_block})" if instr._last_block else ""
+            note  = f"scanned {scanned}×, no setup{block}"
         else:
             note = "no data yet"
         status_lines.append(f"  • <b>{instr.name}</b>: {note}")
@@ -312,10 +319,11 @@ def _evaluate_one(instr: _Instrument, feed: YahooFinanceFeed,
     try:
         candles  = feed.get_candles()
         decision = orchestrator.decide(instr.epic, candles)
-        instr.record_scan()
         if decision.action == "skip":
-            logger.debug("%s: orchestrator skip — %s", instr.epic, decision.reason)
+            logger.info("%s: no signal — %s", instr.epic, decision.reason)
+            instr.record_scan(decision.reason)
             return None
+        instr.record_scan()
         return candles, decision
     except Exception as exc:
         logger.error("%s: evaluation error: %s", instr.epic, exc)

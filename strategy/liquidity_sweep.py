@@ -15,7 +15,7 @@ from strategy.indicators import swing_highs, swing_lows
 
 
 class LiquiditySweepDetector:
-    def __init__(self, lookback: int = 20, sweep_lookback: int = 3, scan_window: int = 4):
+    def __init__(self, lookback: int = 20, sweep_lookback: int = 3, scan_window: int = 6):
         """
         lookback:       number of recent candles to search for the swing pivot level.
         sweep_lookback: pivot detection window (bars each side of the pivot).

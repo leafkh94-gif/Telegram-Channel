@@ -88,7 +88,8 @@ class MarketAgent:
             return AgentVerdict(agent="market", verdict="HOLD",
                                 confidence=0.85, reason="no liquidity sweep setup")
 
-        # ── S/R confluence ────────────────────────────────────────────────────
+        # ── S/R confluence (confidence modifier, not a hard block) ───────────
+        sr_near = False
         if h4 and h1:
             atr_series = _atr(h1, period=14)
             valid_atr  = [v for v in atr_series if v == v]
@@ -96,15 +97,8 @@ class MarketAgent:
                 current_atr = valid_atr[-1]
                 entry       = h1[-1].close
                 levels      = key_levels(h4, h1)
-                if levels and not near_key_level(entry, levels, current_atr, self._sr_atr_mult):
-                    nearest = min(levels, key=lambda lv: abs(entry - lv))
-                    return AgentVerdict(
-                        agent="market", verdict="HOLD",
-                        confidence=0.75,
-                        reason=(f"entry {entry:.2f} not near S/R "
-                                f"(nearest {nearest:.2f}, "
-                                f"dist {abs(entry - nearest):.1f} > {_SR_ATR_MULT * current_atr:.1f})"),
-                    )
+                if levels:
+                    sr_near = near_key_level(entry, levels, current_atr, self._sr_atr_mult)
 
         # ── Volume confirmation ───────────────────────────────────────────────
         vol_label, vol_ratio = _volume_signal(h1)
@@ -115,21 +109,24 @@ class MarketAgent:
                 reason=f"weak volume on sweep ({vol_ratio:.1f}× avg) — low conviction",
             )
 
-        # ── Confidence: ADX strength + volume boost ───────────────────────────
+        # ── Confidence: ADX strength + S/R confluence + volume boost ─────────
         if last_adx is not None:
             confidence = min(0.90, 0.70 + (last_adx - self._adx_threshold) / 100)
         else:
             confidence = 0.70
 
+        if sr_near:
+            confidence = min(0.97, confidence + 0.05)   # +5% for S/R alignment
         if vol_label == "strong":
             confidence = min(0.97, confidence + 0.07)
 
         adx_str = f"ADX {last_adx:.1f}" if last_adx is not None else "ADX n/a"
+        sr_str  = ", near S/R" if sr_near else ""
         vol_str = (f", vol {vol_ratio:.1f}× avg" if vol_label != "unknown" else "")
         return AgentVerdict(
             agent="market",
             verdict="GO",
             confidence=round(confidence, 2),
-            reason=f"H1 {sig.direction} sweep, {adx_str}{vol_str}",
+            reason=f"H1 {sig.direction} sweep, {adx_str}{sr_str}{vol_str}",
             direction=sig.direction,
         )
