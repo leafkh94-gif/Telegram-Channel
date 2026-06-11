@@ -219,11 +219,12 @@ def test_risk_agent_lots_formula():
     assert result.lots == pytest.approx(expected_lots, rel=1e-3)
 
 
-def test_risk_agent_blocks_when_atr_too_large():
-    # ATR=15: lots = 0.0089 < MIN_LOTS=0.01 → BLOCK (correct — account too small)
+def test_risk_agent_uses_min_lot_when_atr_large():
+    # ATR=15: ideal lots = 0.0089 < MIN_LOTS=0.01 → trade the 0.01 minimum, GO
     agent = RiskAgent(account_size_usd=2000, risk_per_trade_pct=0.01)
     result = agent.evaluate("GOLD", entry=2300.0, atr=15.0, direction="buy")
-    assert result.verdict == "BLOCK"
+    assert result.verdict == "GO"
+    assert result.lots == pytest.approx(0.01)
 
 
 def test_risk_agent_block_on_zero_atr():

@@ -21,7 +21,7 @@ from strategy.sr_levels import key_levels, near_key_level
 
 logger = logging.getLogger(__name__)
 
-_ADX_THRESHOLD    = 25
+_ADX_THRESHOLD    = 20    # 20 = medium selectivity; 25 = stricter (fewer signals)
 _SR_ATR_MULT      = 1.0
 _VOL_LOOKBACK     = 20    # bars used to compute average volume
 _VOL_WEAK_RATIO   = 0.5   # sweep volume < 50% of avg → weak (HOLD)
@@ -79,7 +79,7 @@ class MarketAgent:
                     return AgentVerdict(
                         agent="market", verdict="HOLD",
                         confidence=0.9,
-                        reason=f"ADX {last_adx:.1f} < {_ADX_THRESHOLD} — market is choppy",
+                        reason=f"ADX {last_adx:.1f} < {self._adx_threshold} — market is choppy",
                     )
 
         # ── Strategy pipeline (regime → sweep → signal filter) ────────────────
@@ -117,7 +117,7 @@ class MarketAgent:
 
         # ── Confidence: ADX strength + volume boost ───────────────────────────
         if last_adx is not None:
-            confidence = min(0.90, 0.70 + (last_adx - _ADX_THRESHOLD) / 100)
+            confidence = min(0.90, 0.70 + (last_adx - self._adx_threshold) / 100)
         else:
             confidence = 0.70
 

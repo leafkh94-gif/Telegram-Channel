@@ -57,12 +57,18 @@ class RiskAgent:
         raw_lots     = risk_usd / (sl_distance * contract)
         lots         = max(_MIN_LOTS, min(raw_lots, _MAX_LOTS))
 
+        # When the ideal size rounds below the broker minimum, trade the
+        # minimum lot rather than blocking. The actual dollar risk will be
+        # slightly above the target % — surface that in the reason so the
+        # alert is honest about it.
         if raw_lots < _MIN_LOTS:
+            actual_risk = _MIN_LOTS * sl_distance * contract
             return AgentVerdict(
-                agent="risk", verdict="BLOCK",
-                confidence=1.0,
-                reason=(f"computed lots {raw_lots:.4f} < minimum {_MIN_LOTS} "
-                        f"— ATR too large for account size"),
+                agent="risk", verdict="GO",
+                confidence=0.85,
+                reason=(f"{_MIN_LOTS:.2f} lots (min) — actual risk ${actual_risk:.0f} "
+                        f"vs ${risk_usd:.0f} target (ATR high for account)"),
+                lots=_MIN_LOTS,
             )
 
         return AgentVerdict(
