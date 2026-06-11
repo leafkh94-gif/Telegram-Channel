@@ -4,9 +4,11 @@ Market-hours guard — blocks alerts outside trading sessions or within
 
 US equity indices (US500, US100, US30): Mon-Fri 09:30-16:00 ET
   → no alert after 15:30 ET (30-min pre-close buffer)
+  → blocked on NYSE holidays and after early-close cutoff on half-days
 Gold futures (GC=F / GOLD): near-24h, Sun 18:00 – Fri 17:00 ET
   → 1-hour daily maintenance break 17:00-18:00 ET, fully closed Saturday
 """
+import datetime as _dt
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -17,6 +19,26 @@ _EQUITY_CLOSE  = time(16, 0)
 _CLOSE_BUFFER  = timedelta(minutes=30)
 
 _EQUITY_EPICS  = frozenset({"US500", "US100", "US30"})
+
+# NYSE full-day closures 2026
+_US_HOLIDAYS_2026: frozenset[_dt.date] = frozenset({
+    _dt.date(2026, 1,  1),   # New Year's Day
+    _dt.date(2026, 1, 19),   # MLK Day
+    _dt.date(2026, 2, 16),   # Presidents' Day
+    _dt.date(2026, 4,  3),   # Good Friday
+    _dt.date(2026, 5, 25),   # Memorial Day
+    _dt.date(2026, 6, 19),   # Juneteenth
+    _dt.date(2026, 7,  3),   # Independence Day (observed)
+    _dt.date(2026, 9,  7),   # Labor Day
+    _dt.date(2026, 11, 26),  # Thanksgiving
+    _dt.date(2026, 12, 25),  # Christmas
+})
+
+# NYSE early-close days 2026 — market closes at 13:00 ET
+_US_HALF_DAYS_2026: dict[_dt.date, _dt.time] = {
+    _dt.date(2026, 11, 27): _dt.time(13, 0),  # Black Friday
+    _dt.date(2026, 12, 24): _dt.time(13, 0),  # Christmas Eve
+}
 
 
 def is_tradeable(epic: str, now_utc: datetime | None = None) -> bool:
@@ -36,8 +58,14 @@ def is_tradeable(epic: str, now_utc: datetime | None = None) -> bool:
     if epic in _EQUITY_EPICS:
         if weekday >= 5:          # weekend
             return False
+        today = now_et.date()
+        if today in _US_HOLIDAYS_2026:
+            return False
+        early_close = _US_HALF_DAYS_2026.get(today)
+        if early_close and t >= early_close:
+            return False
         cutoff = (
-            datetime.combine(now_et.date(), _EQUITY_CLOSE, tzinfo=_ET)
+            datetime.combine(today, _EQUITY_CLOSE, tzinfo=_ET)
             - _CLOSE_BUFFER
         ).time()                  # 15:30 ET
         return _EQUITY_OPEN <= t <= cutoff
