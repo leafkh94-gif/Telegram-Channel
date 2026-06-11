@@ -67,31 +67,36 @@ class RuleBasedSignalFilter(SignalFilter):
         score = 0
         reasons: list[str] = []
 
-        # 1. RSI
+        # 1. RSI: reversal sweep should arrive from an extreme.
+        # For BUY sweeps: RSI below 50 (came from oversold territory).
+        # For SELL sweeps: RSI above 50 (came from overbought territory).
         rsi_vals = rsi(closes, 14)
         last_rsi = rsi_vals[-1]
         if not math.isnan(last_rsi):
-            if direction == "buy" and last_rsi < self.rsi_overbought:
+            if direction == "buy" and last_rsi < 55.0:
                 score += 1
-                reasons.append(f"rsi={last_rsi:.1f} ok for buy")
-            elif direction == "sell" and last_rsi > self.rsi_oversold:
+                reasons.append(f"rsi={last_rsi:.1f} below 55 (reversal buy zone)")
+            elif direction == "sell" and last_rsi > 45.0:
                 score += 1
-                reasons.append(f"rsi={last_rsi:.1f} ok for sell")
+                reasons.append(f"rsi={last_rsi:.1f} above 45 (reversal sell zone)")
             else:
-                reasons.append(f"rsi={last_rsi:.1f} AGAINST {direction}")
+                reasons.append(f"rsi={last_rsi:.1f} not in reversal zone for {direction}")
 
-        # 2. MACD histogram
+        # 2. MACD histogram momentum — check histogram is turning, not just polarity.
+        # For a reversal BUY sweep: histogram rising (less negative or positive).
+        # For a reversal SELL sweep: histogram falling (less positive or negative).
         _, _, hist = macd(closes, 12, 26, 9)
         last_hist = hist[-1]
-        if not math.isnan(last_hist):
-            if direction == "buy" and last_hist > 0:
+        prev_hist = next((v for v in reversed(hist[:-1]) if not math.isnan(v)), float("nan"))
+        if not (math.isnan(last_hist) or math.isnan(prev_hist)):
+            if direction == "buy" and last_hist >= prev_hist:
                 score += 1
-                reasons.append(f"macd_hist={last_hist:.4f} bullish")
-            elif direction == "sell" and last_hist < 0:
+                reasons.append(f"macd_hist turning up ({prev_hist:.4f}→{last_hist:.4f})")
+            elif direction == "sell" and last_hist <= prev_hist:
                 score += 1
-                reasons.append(f"macd_hist={last_hist:.4f} bearish")
+                reasons.append(f"macd_hist turning down ({prev_hist:.4f}→{last_hist:.4f})")
             else:
-                reasons.append(f"macd_hist={last_hist:.4f} AGAINST {direction}")
+                reasons.append(f"macd_hist still moving AGAINST {direction}")
 
         # 3. Bollinger Band — not over-extended
         upper, _, lower = bollinger_bands(closes, 20, 2.0)
@@ -107,19 +112,19 @@ class RuleBasedSignalFilter(SignalFilter):
             else:
                 reasons.append(f"price outside BB for {direction}")
 
-        # 4. EMA-20 / EMA-50 short-term alignment
-        ema20 = ema(closes, 20)
-        ema50 = ema(closes, 50)
-        e20, e50 = ema20[-1], ema50[-1]
-        if not (math.isnan(e20) or math.isnan(e50)):
-            if direction == "buy" and e20 >= e50:
+        # 4. Candle direction confirms sweep (close vs open)
+        # Liquidity sweeps are reversals — EMA alignment is deliberately wrong.
+        # Instead: the sweep candle itself must close in the signal direction.
+        last_bar = candles[-1]
+        if hasattr(last_bar, "open"):
+            if direction == "buy" and last_bar.close >= last_bar.open:
                 score += 1
-                reasons.append(f"ema20={e20:.2f} >= ema50={e50:.2f} aligned buy")
-            elif direction == "sell" and e20 <= e50:
+                reasons.append(f"close={last_bar.close:.2f} >= open={last_bar.open:.2f} bullish candle")
+            elif direction == "sell" and last_bar.close <= last_bar.open:
                 score += 1
-                reasons.append(f"ema20={e20:.2f} <= ema50={e50:.2f} aligned sell")
+                reasons.append(f"close={last_bar.close:.2f} <= open={last_bar.open:.2f} bearish candle")
             else:
-                reasons.append(f"ema short-term AGAINST {direction}")
+                reasons.append(f"candle direction AGAINST {direction}")
 
         # 5. ATR not spiking
         atr_vals = [v for v in atr(candles, 14) if not math.isnan(v)]
@@ -133,16 +138,25 @@ class RuleBasedSignalFilter(SignalFilter):
             else:
                 reasons.append(f"atr_pct={pct:.0f} SPIKE — deduct")
 
-        # 6. Body-to-range ratio on last bar
+        # 6. Wick confirms rejection (sweep candle has significant wick in sweep direction)
+        # A buy sweep pierces a low and rejects → lower wick should be prominent.
+        # A sell sweep pierces a high and rejects → upper wick should be prominent.
         last_bar = candles[-1]
         bar_range = last_bar.high - last_bar.low
-        body = abs(last_bar.close - last_bar.open) if hasattr(last_bar, "open") else bar_range * 0.5
-        ratio = body / bar_range if bar_range > 0 else 0.0
-        if ratio >= self.min_body_ratio:
-            score += 1
-            reasons.append(f"body_ratio={ratio:.2f} has conviction")
-        else:
-            reasons.append(f"body_ratio={ratio:.2f} weak bar")
+        if bar_range > 0 and hasattr(last_bar, "open"):
+            candle_low  = min(last_bar.open, last_bar.close)
+            candle_high = max(last_bar.open, last_bar.close)
+            lower_wick = candle_low  - last_bar.low
+            upper_wick = last_bar.high - candle_high
+            if direction == "buy":
+                wick_ratio = lower_wick / bar_range
+            else:
+                wick_ratio = upper_wick / bar_range
+            if wick_ratio >= 0.20:
+                score += 1
+                reasons.append(f"wick_ratio={wick_ratio:.2f} confirms rejection")
+            else:
+                reasons.append(f"wick_ratio={wick_ratio:.2f} weak rejection wick")
 
         accepted = score >= self.min_score
         logger.info(
