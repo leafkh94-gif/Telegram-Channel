@@ -85,7 +85,9 @@ def volatility_adjusted_lots(
         return max_lots * 0.5
 
     dollar_risk = account_value_usd * risk_per_trade_pct
-    atr_in_usd = current_atr / entry_price * lot_value_usd
+    # ATR is already in price-unit points; lot_value_usd converts points → USD.
+    # Do NOT divide by entry_price — that would shrink index ATRs by ~20,000×.
+    atr_in_usd = current_atr * lot_value_usd
     lots = dollar_risk / atr_in_usd if atr_in_usd > 0 else max_lots * 0.5
 
     capped = min(lots, max_lots)

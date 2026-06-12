@@ -141,7 +141,6 @@ class RuleBasedSignalFilter(SignalFilter):
         # 6. Wick confirms rejection (sweep candle has significant wick in sweep direction)
         # A buy sweep pierces a low and rejects → lower wick should be prominent.
         # A sell sweep pierces a high and rejects → upper wick should be prominent.
-        last_bar = candles[-1]
         bar_range = last_bar.high - last_bar.low
         if bar_range > 0 and hasattr(last_bar, "open"):
             candle_low  = min(last_bar.open, last_bar.close)
