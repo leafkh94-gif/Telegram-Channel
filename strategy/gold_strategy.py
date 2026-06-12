@@ -14,6 +14,7 @@ from typing import Optional
 
 from execution.models import Signal
 from strategy.base import MarketRegime, MultiTimeframeCandles, StrategyBase, TF_H1, TF_H4
+from strategy.confluence_scorer import ConfluenceScorer
 from strategy.indicators import atr
 from strategy.liquidity_sweep import LiquiditySweepDetector
 from strategy.position_sizer import PositionSizer
@@ -31,12 +32,16 @@ class GoldStrategy(StrategyBase):
         sweep_detector: LiquiditySweepDetector | None = None,
         signal_filter: SignalFilter | None = None,
         position_sizer: PositionSizer | None = None,
+        confluence_scorer: ConfluenceScorer | None = None,
+        min_confluence: int = 3,
     ):
         self.lots = lots
         self.regime_filter = regime_filter or RegimeFilter()
         self.sweep_detector = sweep_detector or LiquiditySweepDetector()
         self.signal_filter = signal_filter or MLSignalFilter()
         self.position_sizer = position_sizer or PositionSizer(fallback_lots=lots)
+        self.confluence_scorer = confluence_scorer or ConfluenceScorer()
+        self.min_confluence = min_confluence
 
     def evaluate(self, candles: MultiTimeframeCandles) -> Optional[Signal]:
         h4 = candles.get(TF_H4, [])
@@ -76,8 +81,22 @@ class GoldStrategy(StrategyBase):
             logger.info("gate4 SKIP: signal filter rejected")
             return None
 
+        # ── Gate 5: confluence scorer ─────────────────────────────────────────
+        conf_result = self.confluence_scorer.score(candles, direction)
+        if conf_result.total < self.min_confluence:
+            for c in conf_result.conditions:
+                if not c.passed:
+                    logger.info("gate5 condition FAIL [%s]: %s", c.name, c.detail)
+            logger.info("gate5 SKIP: confluence %s < 3/5", conf_result.summary())
+            return None
+        logger.info("gate5 PASS: confluence %s", conf_result.summary())
+
+        candidate.confluence = conf_result
+
         logger.info(
-            "signal generated: %s %.2f lots (regime=%s atr=%.4f)",
-            direction, computed_lots, regime.value, last_atr if not math.isnan(last_atr) else -1,
+            "signal generated: %s %.2f lots (regime=%s atr=%.4f confluence=%s)",
+            direction, computed_lots, regime.value,
+            last_atr if not math.isnan(last_atr) else -1,
+            conf_result.summary(),
         )
         return candidate
