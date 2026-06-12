@@ -101,25 +101,33 @@ class ConfluenceScorer:
     # ── Individual condition checks ───────────────────────────────────────────
 
     def _check_price_confirmation(self, h1: list[Candle], direction: str) -> ConditionResult:
+        """
+        Liquidity sweep reversal confirmation.
+
+        BUY sweep : price pierced below the swing LOW then closed back above it.
+                    Confirm when close > swing_low (rejection from low).
+        SELL sweep: price pierced above the swing HIGH then closed back below it.
+                    Confirm when close < swing_high (rejection from high).
+        """
         name = "Price Confirmation"
         try:
             if len(h1) < 10:
                 return ConditionResult(name, False, "Not enough H1 candles")
             last_close = h1[-1].close
             if direction == "buy":
-                level = _swing_high(h1[:-1], lookback=10)
-                if math.isnan(level):
-                    return ConditionResult(name, False, "No swing high found")
-                passed = last_close > level
-                detail = (f"Closed above {level:,.2f}" if passed
-                          else f"No breakout — close {last_close:,.2f} < high {level:,.2f}")
-            else:
                 level = _swing_low(h1[:-1], lookback=10)
                 if math.isnan(level):
                     return ConditionResult(name, False, "No swing low found")
+                passed = last_close > level
+                detail = (f"Closed above swept low {level:,.2f}" if passed
+                          else f"No rejection — close {last_close:,.2f} < low {level:,.2f}")
+            else:
+                level = _swing_high(h1[:-1], lookback=10)
+                if math.isnan(level):
+                    return ConditionResult(name, False, "No swing high found")
                 passed = last_close < level
-                detail = (f"Closed below {level:,.2f}" if passed
-                          else f"No breakdown — close {last_close:,.2f} > low {level:,.2f}")
+                detail = (f"Closed below swept high {level:,.2f}" if passed
+                          else f"No rejection — close {last_close:,.2f} > high {level:,.2f}")
             return ConditionResult(name, passed, detail)
         except Exception as exc:
             logger.debug("confluence c1 error: %s", exc)
