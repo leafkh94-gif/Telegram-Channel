@@ -3,7 +3,9 @@ ConfluenceScorer — 5-condition scoring system for trade quality.
 
 Each condition is worth 1 point. Condition 1 (price confirmation) is
 mandatory: if it fails the scorer returns immediately with total=0.
-An alert requires total >= 3 (condition 1 + at least 2 of conditions 2-5).
+The firing threshold is set by GoldStrategy.min_confluence (default 2 —
+condition 1 + at least 1 of conditions 2-5). Because condition 1 is
+mandatory, counter-trend setups stay blocked even at the lower threshold.
 
 Conditions:
   1. Price confirmation   — H1 close breaks above swing high (buy) or below swing low (sell)
@@ -45,6 +47,12 @@ class ConfluenceResult:
 
     def summary(self) -> str:
         return f"{self.total}/{self.max_score}"
+
+    def percentage(self) -> int:
+        """Confirmation strength as a rounded percentage (0-100)."""
+        if self.max_score <= 0:
+            return 0
+        return round(self.total / self.max_score * 100)
 
 
 def _safe_last(vals: list[float]) -> float:
