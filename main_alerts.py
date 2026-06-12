@@ -43,6 +43,8 @@ from agents.base import TradeDecision
 from alerts.notifier import NullNotifier, TelegramNotifier
 from core.log_sanitizer import setup_logging
 from strategy.base import TF_H1
+from strategy.capital_feed import CapitalComFeed
+from strategy.feed import PriceFeed
 from strategy.confluence_scorer import ConfluenceScorer
 from strategy.indicators import atr as _atr
 from strategy.market_hours import is_tradeable
@@ -434,9 +436,25 @@ def main() -> None:
             "Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to your .env file."
         )
 
-    feeds: dict[str, YahooFinanceFeed] = {
-        instr.epic: YahooFinanceFeed(instr.epic) for instr in WATCHLIST
-    }
+    _use_capital = bool(
+        os.getenv("CAPITAL_API_KEY") and
+        os.getenv("CAPITAL_IDENTIFIER") and
+        os.getenv("CAPITAL_PASSWORD")
+    )
+    if _use_capital:
+        logger.info("Using Capital.com live feed")
+        try:
+            feeds: dict[str, PriceFeed] = {
+                instr.epic: CapitalComFeed(instr.epic) for instr in WATCHLIST
+            }
+        except Exception as exc:
+            logger.warning("Capital.com feed init failed (%s) — falling back to Yahoo Finance", exc)
+            feeds = {instr.epic: YahooFinanceFeed(instr.epic) for instr in WATCHLIST}
+    else:
+        logger.info("No Capital.com credentials found — using Yahoo Finance feed")
+        feeds: dict[str, PriceFeed] = {
+            instr.epic: YahooFinanceFeed(instr.epic) for instr in WATCHLIST
+        }
 
     _load_cooldowns(WATCHLIST)
     orchestrator = Orchestrator()
