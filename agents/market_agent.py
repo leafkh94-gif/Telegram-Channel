@@ -125,11 +125,8 @@ class MarketAgent:
         vol_str  = (f", vol {vol_ratio:.1f}× avg" if vol_label != "unknown" else "")
         conf_str = ""
         if sig.confluence is not None:
-            conds = "  ".join(
-                f"{'✅' if c.passed else '❌'} {c.name}: {c.detail}"
-                for c in sig.confluence.conditions
-            )
-            conf_str = f"\n  Confluence {sig.confluence.summary()} — {conds}"
+            conf_str = (f", confluence {sig.confluence.summary()} "
+                        f"({sig.confluence.percentage()}%)")
         return AgentVerdict(
             agent="market",
             verdict="GO",

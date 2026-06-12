@@ -43,6 +43,7 @@ from agents.base import TradeDecision
 from alerts.notifier import NullNotifier, TelegramNotifier
 from core.log_sanitizer import setup_logging
 from strategy.base import TF_H1
+from strategy.confluence_scorer import ConfluenceScorer
 from strategy.indicators import atr as _atr
 from strategy.market_hours import is_tradeable
 from strategy.yahoo_feed import YahooFinanceFeed
@@ -182,7 +183,8 @@ def _handle_shutdown(sig, frame):  # noqa: ARG001
 # ── Alert formatting ──────────────────────────────────────────────────────────
 
 def _build_message(instr: _Instrument, decision: TradeDecision,
-                   entry: float, tp: float, sl: float) -> tuple[str, str]:
+                   entry: float, tp: float, sl: float,
+                   confluence=None) -> tuple[str, str]:
     """Return (html, plain) alert strings including per-agent reasoning."""
     import datetime
     now       = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -220,6 +222,23 @@ def _build_message(instr: _Instrument, decision: TradeDecision,
         f"R:R Ratio:    1 : {rr:.1f}",
         f"Size:         <b>{decision.lots:.2f} lots</b>  "
         f"(1% risk on ${ACCOUNT_SIZE_USD:,.0f})",
+    ]
+
+    # ── Confirmation breakdown (confluence) ───────────────────────────────────
+    if confluence is not None and confluence.conditions:
+        passed_n = confluence.total
+        total_n  = confluence.max_score
+        pct      = confluence.percentage()
+        html_lines += [
+            "",
+            f"🎯 <b>Confirmation: {passed_n}/{total_n} conditions "
+            f"({pct}% confirmed)</b>",
+        ]
+        for c in confluence.conditions:
+            mark = "✅" if c.passed else "❌"
+            html_lines.append(f"  {mark} <b>{c.name}</b> — {c.detail}")
+
+    html_lines += [
         "",
         f"📊 <b>Agent Analysis:</b>",
         verdict_block,
@@ -357,7 +376,13 @@ def _send_alert(instr: _Instrument, candles: dict, decision: TradeDecision,
             tp = entry - TP_ATR_MULT * current_atr
             sl = entry + SL_ATR_MULT * current_atr
 
-        html, plain = _build_message(instr, decision, entry, tp, sl)
+        confluence = None
+        try:
+            confluence = ConfluenceScorer().score(candles, decision.action)
+        except Exception as exc:
+            logger.debug("%s: confluence scoring failed: %s", instr.epic, exc)
+
+        html, plain = _build_message(instr, decision, entry, tp, sl, confluence)
         _notify(notifier, html, plain)
         instr.mark_alerted()
         _save_cooldown(instr)

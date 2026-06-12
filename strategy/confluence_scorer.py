@@ -48,6 +48,12 @@ class ConfluenceResult:
     def summary(self) -> str:
         return f"{self.total}/{self.max_score}"
 
+    def percentage(self) -> int:
+        """Confirmation strength as a rounded percentage (0-100)."""
+        if self.max_score <= 0:
+            return 0
+        return round(self.total / self.max_score * 100)
+
 
 def _safe_last(vals: list[float]) -> float:
     """Return last non-NaN value or NaN."""

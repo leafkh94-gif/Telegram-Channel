@@ -33,7 +33,7 @@ class GoldStrategy(StrategyBase):
         signal_filter: SignalFilter | None = None,
         position_sizer: PositionSizer | None = None,
         confluence_scorer: ConfluenceScorer | None = None,
-        min_confluence: int = 2,
+        min_confluence: int = 1,
     ):
         self.lots = lots
         self.regime_filter = regime_filter or RegimeFilter()
