@@ -33,7 +33,7 @@ class GoldStrategy(StrategyBase):
         signal_filter: SignalFilter | None = None,
         position_sizer: PositionSizer | None = None,
         confluence_scorer: ConfluenceScorer | None = None,
-        min_confluence: int = 3,
+        min_confluence: int = 2,
     ):
         self.lots = lots
         self.regime_filter = regime_filter or RegimeFilter()
@@ -87,7 +87,7 @@ class GoldStrategy(StrategyBase):
             for c in conf_result.conditions:
                 if not c.passed:
                     logger.info("gate5 condition FAIL [%s]: %s", c.name, c.detail)
-            logger.info("gate5 SKIP: confluence %s < 3/5", conf_result.summary())
+            logger.info("gate5 SKIP: confluence %s < %d/5", conf_result.summary(), self.min_confluence)
             return None
         logger.info("gate5 PASS: confluence %s", conf_result.summary())
 

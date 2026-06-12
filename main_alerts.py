@@ -185,7 +185,7 @@ def _build_message(instr: _Instrument, decision: TradeDecision,
                    entry: float, tp: float, sl: float) -> tuple[str, str]:
     """Return (html, plain) alert strings including per-agent reasoning."""
     import datetime
-    now       = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now       = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     emoji     = "🟢" if decision.action == "buy" else "🔴"
     dir_label = "BUY" if decision.action == "buy" else "SELL"
     risk      = abs(entry - sl)
@@ -419,7 +419,7 @@ def main() -> None:
     orchestrator = Orchestrator()
 
     import datetime as _dt
-    _startup_time = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    _startup_time = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     _notify(
         notifier,
         f"🟡 <b>Alert bot started</b> — <i>{_startup_time}</i>\n"
