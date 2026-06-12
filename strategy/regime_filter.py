@@ -30,8 +30,8 @@ class RegimeFilter:
         ema_slow: int = 200,
         volatile_atr_pct: float = 0.018,        # original param, still primary gate
         adx_period: int = 14,
-        adx_trend_threshold: float = 25.0,
-        hurst_trend_min: float = 0.55,           # tie-breaker when ADX is 20-25
+        adx_trend_threshold: float = 20.0,
+        hurst_trend_min: float = 0.55,           # tie-breaker when ADX is 15-20
     ):
         self.atr_period = atr_period
         self.ema_fast = ema_fast
@@ -83,8 +83,8 @@ class RegimeFilter:
             logger.debug("regime %s: adx=%.1f", regime.value, last_adx)
             return regime
 
-        # Transitional zone (ADX 20-25) — use Hurst exponent as tie-breaker
-        if not math.isnan(last_adx) and last_adx >= 20.0:
+        # Transitional zone (ADX 15-20) — use Hurst exponent as tie-breaker
+        if not math.isnan(last_adx) and last_adx >= 15.0:
             h = hurst_exponent(closes)
             if not math.isnan(h) and h >= self.hurst_trend_min:
                 regime = MarketRegime.TRENDING_UP if up_bias else MarketRegime.TRENDING_DOWN

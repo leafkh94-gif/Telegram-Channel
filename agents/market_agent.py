@@ -21,7 +21,7 @@ from strategy.sr_levels import key_levels, near_key_level
 
 logger = logging.getLogger(__name__)
 
-_ADX_THRESHOLD    = 20    # 20 = medium selectivity; 25 = stricter (fewer signals)
+_ADX_THRESHOLD    = 15    # 15 = loose; 20 = medium; 25 = strict (fewer signals)
 _SR_ATR_MULT      = 1.0
 _VOL_LOOKBACK     = 20    # bars used to compute average volume
 _VOL_WEAK_RATIO   = 0.5   # sweep volume < 50% of avg → weak (HOLD)
@@ -102,12 +102,7 @@ class MarketAgent:
 
         # ── Volume confirmation ───────────────────────────────────────────────
         vol_label, vol_ratio = _volume_signal(h1)
-        if vol_label == "weak":
-            return AgentVerdict(
-                agent="market", verdict="HOLD",
-                confidence=0.80,
-                reason=f"weak volume on sweep ({vol_ratio:.1f}× avg) — low conviction",
-            )
+        # volume is advisory only — weak volume lowers confidence but does not block
 
         # ── Confidence: ADX strength + S/R confluence + volume boost ─────────
         if last_adx is not None:

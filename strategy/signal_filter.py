@@ -45,7 +45,7 @@ class RuleBasedSignalFilter(SignalFilter):
 
     def __init__(
         self,
-        min_score: int = 4,
+        min_score: int = 3,
         rsi_overbought: float = 70.0,
         rsi_oversold: float = 30.0,
         atr_spike_pct: float = 90.0,
