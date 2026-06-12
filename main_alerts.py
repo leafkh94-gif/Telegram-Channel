@@ -56,8 +56,8 @@ SCAN_INTERVAL_S      = 15 * 60        # seconds between full watchlist scans
 SCAN_ALIGN_OFFSET_S  = 90             # seconds after each :00/:15/:30/:45 boundary
 ALERT_COOLDOWN_S     = 60 * 60        # minimum seconds before re-alerting same instrument
 HEARTBEAT_INTERVAL_S = 24 * 60 * 60   # liveness ping every 24h if no alerts fired
-TP_ATR_MULT          = 3.0            # take-profit = entry ± (ATR × 3.0)
-SL_ATR_MULT          = 1.5            # stop-loss   = entry ± (ATR × 1.5)
+TP_ATR_MULT          = 1.5            # take-profit = entry ± (ATR × 1.5)
+SL_ATR_MULT          = 0.75           # stop-loss   = entry ± (ATR × 0.75)
 COOLDOWN_FILE        = os.getenv("COOLDOWN_FILE", ".alert_cooldown.json")
 ACCOUNT_SIZE_USD     = float(os.getenv("ACCOUNT_SIZE_USD", "2000"))
 

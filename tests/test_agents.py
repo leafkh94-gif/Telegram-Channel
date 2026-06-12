@@ -14,7 +14,7 @@ from agents.sentiment_agent import SentimentAgent, _score_post
 from agents.orchestrator import Orchestrator
 from strategy.base import Candle, TF_H1, TF_H4
 from strategy.gold_strategy import GoldStrategy
-from strategy.liquidity_sweep import LiquiditySweepDetector
+from strategy.trend_momentum import TrendMomentumDetector
 from strategy.regime_filter import RegimeFilter
 
 
@@ -29,13 +29,36 @@ def flat_candles(n: int, price: float = 2300.0) -> list[Candle]:
 
 
 def trending_candles(n: int, start: float = 2200.0, step: float = 2.0) -> list[Candle]:
+    """
+    Realistic trending candles for TrendMomentumDetector tests.
+
+    Structure:
+      - First 75 % of bars: wide ATR "warmup" with slight trend drift + occasional pullback.
+        These establish RSI/MACD direction and provide a high ATR baseline.
+      - Last 25 % of bars: narrow ATR "signal zone" with continued trend closes.
+        Current ATR ends up below the 80th-percentile threshold → no spike block.
+        RSI stays above 52 and rising; MACD histogram stays positive.
+    """
     candles, p = [], start
+    direction = 1 if step >= 0 else -1
+    warmup_end = int(n * 0.75)
     for i in range(n):
+        if i < warmup_end:
+            # Wide candles, modest trend + occasional pullback so RSI isn't pegged
+            move = direction * abs(step) * (0.8 if i % 4 != 3 else -0.3)
+            bar_extra = 4.0          # wide range → high ATR in warmup window
+        else:
+            # Narrow candles, *accelerating* trend → MACD histogram grows, ATR stays low
+            accel = 1.0 + (i - warmup_end) * 0.1
+            move = direction * abs(step) * accel
+            bar_extra = 0.5          # tight range → low current ATR
+        high = p + abs(move) + bar_extra
+        low  = p - bar_extra
         candles.append(Candle(
             timestamp=f"2024-01-{(i // 24) + 1:02d}T{i % 24:02d}:00:00Z",
-            open=p, high=p + 3, low=p - 1, close=p + step,
+            open=p, high=high, low=low, close=p + move,
         ))
-        p += step
+        p += move
     return candles
 
 
@@ -60,13 +83,18 @@ def _build_sweep_candles(direction: str, lookback: int = 20,
     return candles
 
 
-def _candles_with_sweep(direction: str) -> dict:
-    """200 flat H4 + sweep H1 candles."""
-    det = LiquiditySweepDetector(lookback=20, sweep_lookback=5)
+def _candles_with_momentum(direction: str) -> dict:
+    """250 trending H4 + 100 trending H1 candles to trigger TrendMomentumDetector."""
+    step = 2.0 if direction == "buy" else -2.0
     return {
-        TF_H4: flat_candles(250),
-        TF_H1: _build_sweep_candles(direction, lookback=20, sweep_lookback=5),
+        TF_H4: trending_candles(250, start=2200.0, step=step),
+        TF_H1: trending_candles(100, start=2200.0, step=step),
     }
+
+
+def _candles_with_sweep(direction: str) -> dict:
+    """Alias kept so existing callers compile; now uses momentum candles."""
+    return _candles_with_momentum(direction)
 
 
 # ── AgentVerdict ──────────────────────────────────────────────────────────────
@@ -113,12 +141,12 @@ def test_market_agent_hold_on_no_signal():
 
 def test_market_agent_go_on_sweep():
     rf    = RegimeFilter(volatile_atr_pct=0.05)
-    det   = LiquiditySweepDetector(lookback=20, sweep_lookback=5)
+    det   = TrendMomentumDetector()
     strat = GoldStrategy(regime_filter=rf, sweep_detector=det)
     # adx_threshold=0 skips ADX gate; sr_atr_mult=999 ensures S/R always passes
-    # min_score=0 bypasses multi-factor threshold so synthetic flat candles pass
+    # min_score=0 bypasses multi-factor threshold so synthetic candles pass
     agent   = MarketAgent(strategy=strat, adx_threshold=0, sr_atr_mult=999, min_score=0)
-    candles = _candles_with_sweep("buy")
+    candles = _candles_with_momentum("buy")
     result  = agent.evaluate("GOLD", candles)
     assert result.verdict == "GO"
     assert result.direction == "buy"
@@ -126,12 +154,12 @@ def test_market_agent_go_on_sweep():
 
 def test_market_agent_go_direction_sell():
     rf    = RegimeFilter(volatile_atr_pct=0.05)
-    det   = LiquiditySweepDetector(lookback=20, sweep_lookback=5)
+    det   = TrendMomentumDetector()
     strat = GoldStrategy(regime_filter=rf, sweep_detector=det)
     # adx_threshold=0 skips ADX gate; sr_atr_mult=999 ensures S/R always passes
-    # min_score=0 bypasses multi-factor threshold so synthetic flat candles pass
+    # min_score=0 bypasses multi-factor threshold so synthetic candles pass
     agent   = MarketAgent(strategy=strat, adx_threshold=0, sr_atr_mult=999, min_score=0)
-    candles = _candles_with_sweep("sell")
+    candles = _candles_with_momentum("sell")
     result  = agent.evaluate("GOLD", candles)
     assert result.verdict == "GO"
     assert result.direction == "sell"
@@ -139,11 +167,11 @@ def test_market_agent_go_direction_sell():
 
 def test_market_agent_confidence_in_range():
     rf    = RegimeFilter(volatile_atr_pct=0.05)
-    det   = LiquiditySweepDetector(lookback=20, sweep_lookback=5)
+    det   = TrendMomentumDetector()
     strat = GoldStrategy(regime_filter=rf, sweep_detector=det)
     # adx_threshold=0 skips ADX gate; sr_atr_mult=999 ensures S/R always passes
     agent   = MarketAgent(strategy=strat, adx_threshold=0, sr_atr_mult=999)
-    candles = _candles_with_sweep("buy")
+    candles = _candles_with_momentum("buy")
     result  = agent.evaluate("GOLD", candles)
     if result.verdict == "GO":
         assert 0.0 <= result.confidence <= 1.0
