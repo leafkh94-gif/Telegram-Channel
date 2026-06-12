@@ -222,16 +222,17 @@ def _build_message(instr: _Instrument, decision: TradeDecision,
         f"R:R Ratio:    1 : {rr:.1f}",
         f"Size:         <b>{decision.lots:.2f} lots</b>  "
         f"(1% risk on ${ACCOUNT_SIZE_USD:,.0f})",
+        "",
+        f"📊 <b>Agent Analysis:</b>",
+        verdict_block,
     ]
 
-    # ── Confirmation breakdown (confluence) ───────────────────────────────────
+    # ── Confirmation breakdown (how many factors agreed) ─────────────────────
     if confluence is not None and confluence.conditions:
-        passed_n = confluence.total
-        total_n  = confluence.max_score
-        pct      = confluence.percentage()
+        pct = confluence.percentage()
         html_lines += [
             "",
-            f"🎯 <b>Confirmation: {passed_n}/{total_n} conditions "
+            f"🎯 <b>Confirmation: {confluence.total}/{confluence.max_score} "
             f"({pct}% confirmed)</b>",
         ]
         for c in confluence.conditions:
@@ -239,9 +240,6 @@ def _build_message(instr: _Instrument, decision: TradeDecision,
             html_lines.append(f"  {mark} <b>{c.name}</b> — {c.detail}")
 
     html_lines += [
-        "",
-        f"📊 <b>Agent Analysis:</b>",
-        verdict_block,
         "",
         "<i>Alert only — always confirm before trading.</i>",
     ]

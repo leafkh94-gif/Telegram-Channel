@@ -81,22 +81,12 @@ class GoldStrategy(StrategyBase):
             logger.info("gate4 SKIP: signal filter rejected")
             return None
 
-        # ── Gate 5: confluence scorer ─────────────────────────────────────────
-        conf_result = self.confluence_scorer.score(candles, direction)
-        if conf_result.total < self.min_confluence:
-            for c in conf_result.conditions:
-                if not c.passed:
-                    logger.info("gate5 condition FAIL [%s]: %s", c.name, c.detail)
-            logger.info("gate5 SKIP: confluence %s < %d/5", conf_result.summary(), self.min_confluence)
-            return None
-        logger.info("gate5 PASS: confluence %s", conf_result.summary())
-
-        candidate.confluence = conf_result
+        # Attach confluence data for the MarketAgent to use in scoring
+        candidate.confluence = self.confluence_scorer.score(candles, direction)
 
         logger.info(
-            "signal generated: %s %.2f lots (regime=%s atr=%.4f confluence=%s)",
+            "signal generated: %s %.2f lots (regime=%s atr=%.4f)",
             direction, computed_lots, regime.value,
             last_atr if not math.isnan(last_atr) else -1,
-            conf_result.summary(),
         )
         return candidate
