@@ -114,10 +114,10 @@ def test_market_agent_hold_on_no_signal():
 def test_market_agent_go_on_sweep():
     rf    = RegimeFilter(volatile_atr_pct=0.05)
     det   = LiquiditySweepDetector(lookback=20, sweep_lookback=5)
-    # min_confluence=0 bypasses Gate 5 so synthetic flat candles don't block
-    strat = GoldStrategy(regime_filter=rf, sweep_detector=det, min_confluence=0)
+    strat = GoldStrategy(regime_filter=rf, sweep_detector=det)
     # adx_threshold=0 skips ADX gate; sr_atr_mult=999 ensures S/R always passes
-    agent   = MarketAgent(strategy=strat, adx_threshold=0, sr_atr_mult=999)
+    # min_score=0 bypasses multi-factor threshold so synthetic flat candles pass
+    agent   = MarketAgent(strategy=strat, adx_threshold=0, sr_atr_mult=999, min_score=0)
     candles = _candles_with_sweep("buy")
     result  = agent.evaluate("GOLD", candles)
     assert result.verdict == "GO"
@@ -127,10 +127,10 @@ def test_market_agent_go_on_sweep():
 def test_market_agent_go_direction_sell():
     rf    = RegimeFilter(volatile_atr_pct=0.05)
     det   = LiquiditySweepDetector(lookback=20, sweep_lookback=5)
-    # min_confluence=0 bypasses Gate 5 so synthetic flat candles don't block
-    strat = GoldStrategy(regime_filter=rf, sweep_detector=det, min_confluence=0)
+    strat = GoldStrategy(regime_filter=rf, sweep_detector=det)
     # adx_threshold=0 skips ADX gate; sr_atr_mult=999 ensures S/R always passes
-    agent   = MarketAgent(strategy=strat, adx_threshold=0, sr_atr_mult=999)
+    # min_score=0 bypasses multi-factor threshold so synthetic flat candles pass
+    agent   = MarketAgent(strategy=strat, adx_threshold=0, sr_atr_mult=999, min_score=0)
     candles = _candles_with_sweep("sell")
     result  = agent.evaluate("GOLD", candles)
     assert result.verdict == "GO"
