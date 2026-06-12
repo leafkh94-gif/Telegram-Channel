@@ -71,9 +71,9 @@ class CapitalComFeed(PriceFeed):
                     self._epic, "demo" if self._base == _DEMO_BASE else "live")
 
     def _login(self) -> None:
-        api_key    = os.getenv("CAPITAL_API_KEY", "")
-        identifier = os.getenv("CAPITAL_IDENTIFIER", "")
-        password   = os.getenv("CAPITAL_PASSWORD", "")
+        api_key    = os.getenv("CAPITAL_API_KEY", "").strip()
+        identifier = os.getenv("CAPITAL_IDENTIFIER", "").strip()
+        password   = os.getenv("CAPITAL_PASSWORD", "").strip()
         if not (api_key and identifier and password):
             raise EnvironmentError(
                 "Capital.com feed requires CAPITAL_API_KEY, "
