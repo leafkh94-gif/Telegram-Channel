@@ -120,13 +120,20 @@ class MarketAgent:
         if vol_label == "strong":
             confidence = min(0.97, confidence + 0.07)
 
-        adx_str = f"ADX {last_adx:.1f}" if last_adx is not None else "ADX n/a"
-        sr_str  = ", near S/R" if sr_near else ""
-        vol_str = (f", vol {vol_ratio:.1f}× avg" if vol_label != "unknown" else "")
+        adx_str  = f"ADX {last_adx:.1f}" if last_adx is not None else "ADX n/a"
+        sr_str   = ", near S/R" if sr_near else ""
+        vol_str  = (f", vol {vol_ratio:.1f}× avg" if vol_label != "unknown" else "")
+        conf_str = ""
+        if sig.confluence is not None:
+            conds = "  ".join(
+                f"{'✅' if c.passed else '❌'} {c.name}: {c.detail}"
+                for c in sig.confluence.conditions
+            )
+            conf_str = f"\n  Confluence {sig.confluence.summary()} — {conds}"
         return AgentVerdict(
             agent="market",
             verdict="GO",
             confidence=round(confidence, 2),
-            reason=f"H1 {sig.direction} sweep, {adx_str}{sr_str}{vol_str}",
+            reason=f"H1 {sig.direction} sweep, {adx_str}{sr_str}{vol_str}{conf_str}",
             direction=sig.direction,
         )

@@ -4,7 +4,7 @@ Strategy produces Signal objects — execution consumes them and returns Orders.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 import uuid
 
 
@@ -16,6 +16,7 @@ class Signal:
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
     comment: str = ""
+    confluence: Optional[Any] = None   # ConfluenceResult from confluence_scorer
 
     def __post_init__(self):
         if self.direction not in ("buy", "sell"):
