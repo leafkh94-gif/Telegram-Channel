@@ -53,8 +53,10 @@ ENABLE_LONGS  = True
 MIN_LOT_SIZE = 1.0;  LOT_STEP = 1.0
 
 # ---- Time (UTC) ---------------------------------------------------------------------
-ENTRY_START_UTC="07:00"; ENTRY_END_UTC="15:00"; HARD_FLAT_UTC="18:30"
-MAX_HOLD_HOURS=4.0; SCAN_EVERY_MIN=5; WEEKDAYS_ONLY=True
+# Market hours: Sun 22:00 UTC → Fri 21:00 UTC, daily close 21:00–22:00 UTC
+# (= Dubai: Mon 02:00 → Sat 01:00, daily close 01:00–02:00)
+HARD_FLAT_UTC="20:45"   # force-flat 15 min before daily close
+MAX_HOLD_HOURS=4.0; SCAN_EVERY_MIN=5
 
 # ---- Alert controls -----------------------------------------------------------------
 SCORE_A_PLUS=75; SCORE_A_PLUS_FLOOR=65; SCORE_A_PLUS_CEIL=85
@@ -97,6 +99,32 @@ def log(msg): print(f"[{now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC] {msg}", fl
 def hhmm_today(now,hhmm):
     h,m=(int(x) for x in hhmm.split(":")); return now.replace(hour=h,minute=m,second=0,microsecond=0)
 def fmt_both(dt): return f"{dt.strftime('%H:%M')} UTC ({dt.astimezone(DUBAI).strftime('%H:%M')} Dubai)"
+
+def is_market_closed(now):
+    """
+    Market is closed when:
+      - Weekend window: Friday 21:00 UTC → Sunday 22:00 UTC
+        (Dubai: Saturday 01:00 → Monday 02:00)
+      - Daily close:    21:00–22:00 UTC every day
+        (Dubai: 01:00–02:00)
+    """
+    wd = now.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+    hm = now.hour * 60 + now.minute
+    daily_close_start = 21 * 60   # 21:00 UTC
+    daily_close_end   = 22 * 60   # 22:00 UTC
+    # Daily maintenance window
+    if daily_close_start <= hm < daily_close_end:
+        return True
+    # Saturday: always closed
+    if wd == 5:
+        return True
+    # Friday after 21:00 UTC: closed
+    if wd == 4 and hm >= daily_close_start:
+        return True
+    # Sunday before 22:00 UTC: closed
+    if wd == 6 and hm < daily_close_end:
+        return True
+    return False
 
 def in_blackout(now):
     t=now.strftime("%H:%M")
@@ -847,20 +875,20 @@ def alert_text(c,cfg,tier,now,st):
 
 def run_cycle(loop_mode):
     now=now_utc()
-    if WEEKDAYS_ONLY and now.weekday()>=5:
-        if loop_mode: log("Weekend.")
+    if is_market_closed(now):
+        if loop_mode: log(f"Market closed ({now.strftime('%A %H:%M')} UTC).")
         return
     st=load_state()
     if is_halted(st):
         log(f"HALTED until {st.get('halted_until')}."); return
     outcomes=read_outcomes()
     if outcomes: st["consecutive_losses"]=count_consec_losses(outcomes)
-    entry_start=hhmm_today(now,ENTRY_START_UTC)
-    entry_end=hhmm_today(now,ENTRY_END_UTC)
+    # Hard flat = 15 min before daily close (21:00 UTC)
     hard_flat=hhmm_today(now,HARD_FLAT_UTC)
 
-    # digest
-    if now>=entry_end and not st.get("digest_sent"):
+    # Daily digest at end of each trading day (just before daily close)
+    digest_time=hhmm_today(now,"20:30")
+    if now>=digest_time and not st.get("digest_sent"):
         best=st.get("best_today")
         bt=f"best: {best['symbol']} {best['strategy']} {best['side']} scored {best['score']:.0f}" if best else "no qualifying setup"
         ws=""
@@ -874,8 +902,6 @@ def run_cycle(loop_mode):
                 f"{ws}\nA no-trade day is a winning day.")
         st["digest_sent"]=True; save_state(st); return
 
-    if not (entry_start<=now<entry_end):
-        if loop_mode: log("Outside window."); return
     if in_blackout(now):
         log("News blackout."); return
     if float(st.get("daily_risk_exposure",0))>=DAILY_LOSS_LIMIT_PCT:
