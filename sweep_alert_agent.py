@@ -31,9 +31,9 @@ Env:  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 Deps: pip install yfinance pandas requests
 """
 
-import os, sys, csv, json, time, math, random, traceback
+import os, sys, csv, json, time, math, random, traceback, threading
 from datetime import datetime, timedelta, timezone
-import requests, pandas as pd, yfinance as yf
+import requests, pandas as pd
 
 # =====================================================================================
 # CONFIG
@@ -90,8 +90,107 @@ EXTRA_BLACKOUTS_UTC=[]
 STATE_FILE="agent_state.json"; SIGNALS_CSV="signals_log.csv"
 DUBAI=timezone(timedelta(hours=4))
 
+# Capital.com epic mapping
+CAPITAL_EPICS = {
+    "GOLD":   "GOLD",
+    "SP500":  "US500",
+    "NASDAQ": "US100",
+    "DOW":    "US30",
+}
+
 # =====================================================================================
-# Utilities + Telegram (unchanged)
+# Capital.com data layer (shared singleton session)
+# =====================================================================================
+
+_CAP_DEMO_BASE = "https://demo-api-capital.backend-capital.com/api/v1"
+_CAP_LIVE_BASE = "https://api-capital.backend-capital.com/api/v1"
+_CAP_TIMEOUT   = 15
+_CAP_PING_INT  = 8 * 60
+
+class _CapSession:
+    def __init__(self):
+        self._base = ""; self._cst = ""; self._token = ""
+        self._lock = threading.Lock(); self._started = False
+
+    def init(self):
+        with self._lock:
+            if self._cst: return
+            use_demo = os.getenv("CAPITAL_DEMO","").lower() == "true"
+            self._base = _CAP_DEMO_BASE if use_demo else _CAP_LIVE_BASE
+            self._login()
+            if not self._started:
+                threading.Thread(target=self._keepalive, daemon=True).start()
+                self._started = True
+
+    def _login(self):
+        api_key    = os.getenv("CAPITAL_API_KEY","").strip()
+        identifier = os.getenv("CAPITAL_IDENTIFIER","").strip()
+        password   = os.getenv("CAPITAL_PASSWORD","").strip()
+        r = requests.post(f"{self._base}/session",
+            headers={"X-CAP-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"identifier": identifier, "password": password, "encryptedPassword": False},
+            timeout=_CAP_TIMEOUT)
+        r.raise_for_status()
+        self._cst   = r.headers["CST"]
+        self._token = r.headers["X-SECURITY-TOKEN"]
+
+    def _headers(self):
+        with self._lock:
+            return {"CST": self._cst, "X-SECURITY-TOKEN": self._token,
+                    "Content-Type": "application/json"}
+
+    def get(self, path, params=None):
+        r = requests.get(f"{self._base}{path}", headers=self._headers(),
+                         params=params, timeout=_CAP_TIMEOUT)
+        if r.status_code == 401:
+            with self._lock: self._login()
+            r = requests.get(f"{self._base}{path}", headers=self._headers(),
+                             params=params, timeout=_CAP_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+
+    def _keepalive(self):
+        while True:
+            time.sleep(_CAP_PING_INT)
+            try: requests.get(f"{self._base}/ping", headers=self._headers(), timeout=_CAP_TIMEOUT)
+            except: pass
+
+_cap = _CapSession()
+_cap_ready = False
+
+def _ensure_capital():
+    global _cap_ready
+    if _cap_ready: return True
+    key = os.getenv("CAPITAL_API_KEY","").strip()
+    if not key: return False
+    try:
+        _cap.init(); _cap_ready = True; return True
+    except Exception as e:
+        print(f"[Capital.com] login failed: {e}", flush=True); return False
+
+_CAP_RESOLUTION = {"15m": "MINUTE_15", "1h": "HOUR", "1d": "DAY"}
+
+def _cap_fetch(epic, resolution, count):
+    data = _cap.get(f"/prices/{epic}",
+                    params={"resolution": _CAP_RESOLUTION[resolution], "max": count})
+    rows = []
+    for p in data.get("prices", []):
+        def mid(s): b=s.get("bid") or 0; a=s.get("ask") or 0; return (float(b)+float(a))/2 if b and a else float(b or a or 0)
+        try:
+            ts = pd.Timestamp(p["snapshotTime"], tz="UTC")
+            rows.append({"Open": mid(p["openPrice"]), "High": mid(p["highPrice"]),
+                         "Low": mid(p["lowPrice"]),  "Close": mid(p["closePrice"])})
+        except: pass
+    if not rows: return None
+    df = pd.DataFrame(rows)
+    # build a DatetimeIndex (Capital doesn't return timestamps in order sometimes)
+    freq = {"15m": "15min", "1h": "h", "1d": "D"}[resolution]
+    end = pd.Timestamp.utcnow().floor(freq)
+    df.index = pd.date_range(end=end, periods=len(df), freq=freq, tz="UTC")
+    return df
+
+# =====================================================================================
+# Utilities + Telegram
 # =====================================================================================
 
 def now_utc(): return datetime.now(timezone.utc)
@@ -909,15 +1008,36 @@ def run_cycle(loop_mode):
         log("Daily risk limit reached."); return
     watch_only=is_watch_only(st)
 
-    dxy_df=fetch(DXY_YF,"15m","5d")
-    dxy=dxy_state(closed_bars(dxy_df,15,now)) if dxy_df is not None else "flat"
+    # DXY — Yahoo Finance only (Capital.com doesn't carry DX-Y)
+    dxy = "flat"
+    try:
+        import yfinance as yf
+        dxy_df = yf.Ticker(DXY_YF).history(period="5d", interval="15m", auto_adjust=False)
+        if dxy_df is not None and len(dxy_df) > 0:
+            dxy_df = dxy_df[["Open","High","Low","Close"]].dropna()
+            if dxy_df.index.tz is None: dxy_df.index = dxy_df.index.tz_localize("UTC")
+            else: dxy_df.index = dxy_df.index.tz_convert("UTC")
+            dxy = dxy_state(closed_bars(dxy_df, 15, now))
+    except Exception as e:
+        log(f"DXY fetch failed (non-critical): {e}")
+
+    use_capital = _ensure_capital()
 
     all_candidates=[]
     for name,cfg in SYMBOLS.items():
         time.sleep(2)
-        m15=fetch(cfg["yf"],"15m","5d")
-        h1=fetch(cfg["yf"],"1h","1mo")
-        d1=fetch(cfg["yf"],"1d","6mo")
+        try:
+            if use_capital:
+                epic = CAPITAL_EPICS[name]
+                m15 = _cap_fetch(epic, "15m", 400)
+                h1  = _cap_fetch(epic, "1h",  300)
+                d1  = _cap_fetch(epic, "1d",  300)
+            else:
+                m15 = fetch(cfg["yf"], "15m", "5d")
+                h1  = fetch(cfg["yf"], "1h",  "1mo")
+                d1  = fetch(cfg["yf"], "1d",  "6mo")
+        except Exception as e:
+            log(f"{name}: data fetch error: {e}"); continue
         if m15 is None or h1 is None or d1 is None: continue
         m15c=closed_bars(m15,15,now); h1c=closed_bars(h1,60,now)
         d1c=closed_bars(d1,1440,now)
