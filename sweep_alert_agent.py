@@ -886,9 +886,10 @@ def run_cycle(loop_mode):
     # Hard flat = 15 min before daily close (21:00 UTC)
     hard_flat=hhmm_today(now,HARD_FLAT_UTC)
 
-    # Daily digest at end of each trading day (just before daily close)
+    # Daily digest: fire once between 20:30–21:00 UTC (just before daily close)
     digest_time=hhmm_today(now,"20:30")
-    if now>=digest_time and not st.get("digest_sent"):
+    digest_cutoff=hhmm_today(now,"21:00")
+    if digest_time<=now<digest_cutoff and not st.get("digest_sent"):
         best=st.get("best_today")
         bt=f"best: {best['symbol']} {best['strategy']} {best['side']} scored {best['score']:.0f}" if best else "no qualifying setup"
         ws=""
