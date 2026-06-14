@@ -58,6 +58,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          CAPITAL_API_KEY:      ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_IDENTIFIER:   ${{ secrets.CAPITAL_IDENTIFIER }}
+          CAPITAL_PASSWORD:     ${{ secrets.CAPITAL_PASSWORD }}
           ENVIRONMENT:          development
 
       - name: Self-chain — queue the next run immediately
