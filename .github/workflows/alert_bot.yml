@@ -3,7 +3,7 @@ name: Trading Alert Bot
 # Reliable 24/7 coverage on a PUBLIC repo (unlimited free Actions minutes).
 #
 # How it works:
-#   * Each run executes main_alerts.py for ~5h40m then exits cleanly.
+#   * Each run executes sweep_alert_agent.py for ~5h40m then exits cleanly.
 #   * At the end of each run a "self-chain" step triggers the next run via
 #     the GitHub API — guaranteed handoff with no gap, no cron scheduler needed.
 #   * The schedule cron is a recovery-only watchdog: if the chain ever dies for
@@ -28,7 +28,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 355     # hard ceiling; main_alerts exits before this via MAX_RUNTIME_S
+    timeout-minutes: 355     # hard ceiling; agent exits its own loop before this
 
     steps:
       - name: Checkout code
@@ -43,26 +43,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-alerts.txt
 
-      - name: Restore cooldown state
+      - name: Restore agent state
         uses: actions/cache@v4
         with:
-          path: .alert_cooldown.json
-          key: cooldown-${{ github.run_id }}
+          path: |
+            agent_state.json
+            signals_log.csv
+          key: agent-state-${{ github.run_id }}
           restore-keys: |
-            cooldown-
+            agent-state-
 
       - name: Run alert bot (continuous, ~5h40m then clean handoff)
-        run: python main_alerts.py
+        run: timeout 20400 python sweep_alert_agent.py || true
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
-          CAPITAL_API_KEY:      ${{ secrets.CAPITAL_API_KEY }}
-          CAPITAL_IDENTIFIER:   ${{ secrets.CAPITAL_IDENTIFIER }}
-          CAPITAL_PASSWORD:     ${{ secrets.CAPITAL_PASSWORD }}
           ENVIRONMENT:          development
-          MAX_RUNTIME_S:        '20400'   # 340 min = 5h40m
-          PORT:                 '8080'
 
       - name: Self-chain — queue the next run immediately
         if: always()
