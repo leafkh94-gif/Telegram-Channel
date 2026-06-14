@@ -9,3 +9,5 @@ __pycache__/
 backtest_results/
 .pytest_cache/
 *.db
+agent_state.json
+signals_log.csv
