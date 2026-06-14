@@ -185,7 +185,7 @@ def _cap_fetch(epic, resolution, count):
     df = pd.DataFrame(rows)
     # build a DatetimeIndex (Capital doesn't return timestamps in order sometimes)
     freq = {"15m": "15min", "1h": "h", "1d": "D"}[resolution]
-    end = pd.Timestamp.utcnow().floor(freq)
+    end = pd.Timestamp.now("UTC").floor(freq)
     df.index = pd.date_range(end=end, periods=len(df), freq=freq, tz="UTC")
     return df
 
@@ -1046,6 +1046,8 @@ def run_cycle(loop_mode):
 
         atr15=atr(m15c.tail(120),14); atr1h=atr(h1c.tail(120),14)
         if atr15<=0 or atr1h<=0: continue
+
+        log(f"{name}: scanning {len(m15c)} M15 bars, close={m15c['Close'].iloc[-1]:.2f}, ATR15={atr15:.2f}")
 
         # Volatility regime gate (Trading Bot Strategy Gate 2)
         if is_volatile(m15c):
