@@ -1032,7 +1032,7 @@ def self_test():
         tg_send("v3.0 ready — 5 strategies:\n"
                 "1. Zone Rejection\n2. Liquidity Sweep\n3. Double Top/Bottom\n"
                 "4. Bear/Bull Flag\n5. Post-News Retest\n"
-                f"Window: {ENTRY_START_UTC}-{ENTRY_END_UTC} UTC\n"
+                f"Window: Sun 22:00–Fri 21:00 UTC, daily close 21:00–22:00 UTC\n"
                 f"Circuit breakers: {CONSEC_LOSS_REDUCE}/{CONSEC_LOSS_MIN_SIZE}/{CONSEC_LOSS_HALT}")
 
 def main():
@@ -1042,7 +1042,7 @@ def main():
         try: run_cycle(False)
         except: log("Crash:\n"+traceback.format_exc())
         return
-    log(f"v3.0 loop: {SCAN_EVERY_MIN}min, 5 strategies, {ENTRY_START_UTC}-{ENTRY_END_UTC} UTC")
+    log(f"v3.0 loop: {SCAN_EVERY_MIN}min, 5 strategies, Sun 22:00–Fri 21:00 UTC")
     tg_send(f"Agent v3.0 online — 5 strategies × {len(SYMBOLS)} instruments\n"
             f"Every {SCAN_EVERY_MIN}min | max {MAX_APLUS_PER_DAY} A+/day | circuit breakers ON")
     while True:
