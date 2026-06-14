@@ -56,7 +56,7 @@ MIN_LOT_SIZE = 1.0;  LOT_STEP = 1.0
 # Market hours: Sun 22:00 UTC → Fri 21:00 UTC, daily close 21:00–22:00 UTC
 # (= Dubai: Mon 02:00 → Sat 01:00, daily close 01:00–02:00)
 HARD_FLAT_UTC="20:45"   # force-flat 15 min before daily close
-MAX_HOLD_HOURS=4.0; SCAN_EVERY_MIN=5
+MAX_HOLD_HOURS=4.0; SCAN_EVERY_MIN=15
 
 # ---- Alert controls -----------------------------------------------------------------
 SCORE_A_PLUS=75; SCORE_A_PLUS_FLOOR=65; SCORE_A_PLUS_CEIL=85
