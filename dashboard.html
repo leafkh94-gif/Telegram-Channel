@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trading Alert Bot — Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0d1117; color: #e6edf3; min-height: 100vh; padding: 24px; }
+  h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 4px; }
+  .subtitle { color: #7d8590; font-size: 0.85rem; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; }
+  .card h2 { font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
+              letter-spacing: .08em; color: #7d8590; margin-bottom: 14px; }
+  .stat { display: flex; justify-content: space-between; align-items: center;
+          padding: 8px 0; border-bottom: 1px solid #21262d; }
+  .stat:last-child { border-bottom: none; }
+  .stat-label { font-size: 0.85rem; color: #8b949e; }
+  .stat-value { font-size: 0.9rem; font-weight: 600; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px;
+           font-size: 0.75rem; font-weight: 600; }
+  .green  { background: #1a4731; color: #3fb950; }
+  .yellow { background: #3d2b00; color: #e3b341; }
+  .red    { background: #4a1b1b; color: #f85149; }
+  .grey   { background: #21262d; color: #8b949e; }
+  .run-row { display: flex; align-items: center; gap: 10px; padding: 8px 0;
+              border-bottom: 1px solid #21262d; font-size: 0.83rem; }
+  .run-row:last-child { border-bottom: none; }
+  .run-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .dot-green  { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+  .dot-yellow { background: #e3b341; }
+  .dot-red    { background: #f85149; }
+  .dot-grey   { background: #8b949e; }
+  .run-info { flex: 1; }
+  .run-time { color: #7d8590; font-size: 0.75rem; }
+  .instrument-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .instrument { background: #21262d; border-radius: 8px; padding: 10px 12px; }
+  .instrument .name { font-size: 0.85rem; font-weight: 600; }
+  .instrument .epic { font-size: 0.72rem; color: #7d8590; margin-top: 2px; }
+  .refresh-btn { background: #21262d; border: 1px solid #30363d; color: #e6edf3;
+                 border-radius: 8px; padding: 8px 16px; font-size: 0.8rem;
+                 cursor: pointer; transition: background .15s; }
+  .refresh-btn:hover { background: #30363d; }
+  #last-refresh { font-size: 0.75rem; color: #7d8590; margin-left: 10px; }
+  .footer { margin-top: 20px; display: flex; align-items: center; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .spinner { display: inline-block; width: 14px; height: 14px;
+             border: 2px solid #30363d; border-top-color: #58a6ff;
+             border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .error-msg { color: #f85149; font-size: 0.82rem; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<h1>Trading Alert Bot</h1>
+<p class="subtitle">5-strategy multi-timeframe scanner · Capital.com live feed · Telegram alerts</p>
+
+<div class="grid">
+
+  <!-- Live Run Status -->
+  <div class="card" id="card-runs">
+    <h2>GitHub Actions — Recent Runs</h2>
+    <div id="runs-content"><span class="spinner"></span></div>
+  </div>
+
+  <!-- Bot Configuration -->
+  <div class="card">
+    <h2>Bot Configuration</h2>
+    <div class="stat">
+      <span class="stat-label">Scan interval</span>
+      <span class="stat-value">15 min</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">A+ threshold</span>
+      <span class="stat-value">75 (adaptive 65–85)</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">WATCH threshold</span>
+      <span class="stat-value">62</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Max A+ / day</span>
+      <span class="stat-value">4</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Max WATCH / day</span>
+      <span class="stat-value">1</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Cooldown per symbol</span>
+      <span class="stat-value">90 min</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Min gap between alerts</span>
+      <span class="stat-value">30 min</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Risk per A+ trade</span>
+      <span class="stat-value">1%</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Max hold</span>
+      <span class="stat-value">8 h</span>
+    </div>
+  </div>
+
+  <!-- Market Hours -->
+  <div class="card">
+    <h2>Market Hours (CFD)</h2>
+    <div class="stat">
+      <span class="stat-label">Weekly open</span>
+      <span class="stat-value">Sun 22:00 UTC / Mon 02:00 Dubai</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Weekly close</span>
+      <span class="stat-value">Fri 21:00 UTC / Sat 01:00 Dubai</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Daily maintenance</span>
+      <span class="stat-value">21:00–22:00 UTC (01:00–02:00 Dubai)</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">News blackout 1</span>
+      <span class="stat-value">12:25–13:05 UTC</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">News blackout 2</span>
+      <span class="stat-value">13:25–14:05 UTC</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Daily digest</span>
+      <span class="stat-value">20:30–21:00 UTC</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Market status now</span>
+      <span class="stat-value" id="market-status"><span class="spinner"></span></span>
+    </div>
+  </div>
+
+  <!-- Instruments -->
+  <div class="card">
+    <h2>Instruments (4)</h2>
+    <div class="instrument-grid">
+      <div class="instrument"><div class="name">Gold</div><div class="epic">GOLD · XAU/USD</div></div>
+      <div class="instrument"><div class="name">S&amp;P 500</div><div class="epic">US500 · CFD</div></div>
+      <div class="instrument"><div class="name">Nasdaq 100</div><div class="epic">US100 · CFD</div></div>
+      <div class="instrument"><div class="name">Dow Jones</div><div class="epic">US30 · CFD</div></div>
+    </div>
+  </div>
+
+  <!-- Strategies -->
+  <div class="card">
+    <h2>5 Strategies</h2>
+    <div class="stat"><span class="stat-label">1</span><span class="stat-value">Supply / Demand Zone Rejection</span></div>
+    <div class="stat"><span class="stat-label">2</span><span class="stat-value">Liquidity Sweep + Break of Structure</span></div>
+    <div class="stat"><span class="stat-label">3</span><span class="stat-value">Double Top / Bottom + Head &amp; Shoulders</span></div>
+    <div class="stat"><span class="stat-label">4</span><span class="stat-value">Bear / Bull Flag Breakout</span></div>
+    <div class="stat"><span class="stat-label">5</span><span class="stat-value">Post-News Retest</span></div>
+  </div>
+
+  <!-- Score Breakdown -->
+  <div class="card">
+    <h2>Score Breakdown (max ~96)</h2>
+    <div class="stat"><span class="stat-label">Base score (pattern quality)</span><span class="stat-value">34–38</span></div>
+    <div class="stat"><span class="stat-label">Pattern bonus (ATR-scaled)</span><span class="stat-value">0–10</span></div>
+    <div class="stat"><span class="stat-label">Indicators (RSI+MACD+EMA)</span><span class="stat-value">0, 4, or 10</span></div>
+    <div class="stat"><span class="stat-label">HTF bias alignment</span><span class="stat-value">−8, +5, or +15</span></div>
+    <div class="stat"><span class="stat-label">Session timing</span><span class="stat-value">0, +6, or +10</span></div>
+    <div class="stat"><span class="stat-label">DXY confluence (gold)</span><span class="stat-value">−4 or +8</span></div>
+    <div class="stat"><span class="stat-label">Round number proximity</span><span class="stat-value">+5</span></div>
+  </div>
+
+  <!-- Circuit Breakers -->
+  <div class="card">
+    <h2>Circuit Breakers</h2>
+    <div class="stat"><span class="stat-label">Consecutive loss halt</span><span class="stat-value">3 losses → pause</span></div>
+    <div class="stat"><span class="stat-label">Daily loss limit</span><span class="stat-value">3% of account</span></div>
+    <div class="stat"><span class="stat-label">Weekly loss limit</span><span class="stat-value">6% of account</span></div>
+    <div class="stat"><span class="stat-label">3× daily limits in a row</span><span class="stat-value">2-day halt</span></div>
+    <div class="stat"><span class="stat-label">Adaptive threshold</span><span class="stat-value">raises after busy days, lowers after silent days</span></div>
+  </div>
+
+</div>
+
+<div class="footer">
+  <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
+  <span id="last-refresh"></span>
+  &nbsp;&nbsp;
+  <a href="https://github.com/leafkh94-gif/Telegram-Channel/actions/workflows/alert_bot.yml" target="_blank">→ View live Actions run</a>
+</div>
+
+<script>
+const OWNER = 'leafkh94-gif';
+const REPO  = 'Telegram-Channel';
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString('en-GB', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit', timeZone:'UTC' }) + ' UTC';
+}
+
+function runDot(status, conclusion) {
+  if (status === 'in_progress' || status === 'queued') return 'dot-yellow';
+  if (conclusion === 'success') return 'dot-green';
+  if (conclusion === 'failure') return 'dot-red';
+  if (conclusion === 'cancelled') return 'dot-grey';
+  return 'dot-grey';
+}
+
+function runBadge(status, conclusion) {
+  if (status === 'in_progress') return '<span class="badge yellow">running</span>';
+  if (status === 'queued')      return '<span class="badge yellow">queued</span>';
+  if (conclusion === 'success') return '<span class="badge green">success</span>';
+  if (conclusion === 'failure') return '<span class="badge red">failed</span>';
+  if (conclusion === 'cancelled') return '<span class="badge grey">cancelled</span>';
+  return '<span class="badge grey">'+status+'</span>';
+}
+
+async function loadRuns() {
+  const el = document.getElementById('runs-content');
+  try {
+    const r = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/alert_bot.yml/runs?per_page=6`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const runs = data.workflow_runs || [];
+    if (!runs.length) { el.innerHTML = '<p class="error-msg">No runs found.</p>'; return; }
+    el.innerHTML = runs.map(run => `
+      <div class="run-row">
+        <div class="run-dot ${runDot(run.status, run.conclusion)}"></div>
+        <div class="run-info">
+          <div>${runBadge(run.status, run.conclusion)} <a href="${run.html_url}" target="_blank">#${run.run_number}</a></div>
+          <div class="run-time">${fmtTime(run.created_at)}</div>
+        </div>
+      </div>`).join('');
+  } catch(e) {
+    el.innerHTML = `<p class="error-msg">Could not load runs: ${e.message}<br>
+      <a href="https://github.com/${OWNER}/${REPO}/actions/workflows/alert_bot.yml" target="_blank">View on GitHub →</a></p>`;
+  }
+}
+
+function updateMarketStatus() {
+  const el = document.getElementById('market-status');
+  const now = new Date();
+  const day = now.getUTCDay(); // 0=Sun, 5=Fri, 6=Sat
+  const h = now.getUTCHours() + now.getUTCMinutes() / 60;
+
+  let closed = false;
+  let reason = '';
+
+  if (day === 6) { closed = true; reason = 'Weekend (closed until Sun 22:00 UTC)'; }
+  else if (day === 0 && h < 22) { closed = true; reason = 'Weekend (opens Sun 22:00 UTC)'; }
+  else if (day === 5 && h >= 21) { closed = true; reason = 'Weekly close (reopens Sun 22:00 UTC)'; }
+  else if (h >= 21 && h < 22) { closed = true; reason = 'Daily maintenance (21:00–22:00 UTC)'; }
+
+  if (closed) {
+    el.innerHTML = `<span class="badge red">Closed</span> <small style="color:#7d8590">${reason}</small>`;
+  } else {
+    el.innerHTML = `<span class="badge green">Open</span>`;
+  }
+}
+
+function refresh() {
+  document.getElementById('runs-content').innerHTML = '<span class="spinner"></span>';
+  loadRuns();
+  updateMarketStatus();
+  document.getElementById('last-refresh').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
+}
+
+refresh();
+setInterval(refresh, 5 * 60 * 1000); // auto-refresh every 5 min
+</script>
+</body>
+</html>
