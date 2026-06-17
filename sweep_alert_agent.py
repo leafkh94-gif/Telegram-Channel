@@ -31,7 +31,7 @@ Env:  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 Deps: pip install yfinance pandas requests
 """
 
-import os, sys, csv, json, time, math, random, traceback, threading, base64
+import os, sys, csv, json, time, math, random, traceback, threading, base64, socket
 from datetime import datetime, timedelta, timezone
 import requests, pandas as pd
 
@@ -1064,7 +1064,12 @@ def run_cycle(loop_mode):
     dxy = "flat"
     try:
         import yfinance as yf
-        dxy_df = yf.Ticker(DXY_YF).history(period="5d", interval="15m", auto_adjust=False)
+        _old_to = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(20)   # prevent yfinance hanging indefinitely
+        try:
+            dxy_df = yf.Ticker(DXY_YF).history(period="5d", interval="15m", auto_adjust=False)
+        finally:
+            socket.setdefaulttimeout(_old_to)
         if dxy_df is not None and len(dxy_df) > 0:
             dxy_df = dxy_df[["Open","High","Low","Close"]].dropna()
             if dxy_df.index.tz is None: dxy_df.index = dxy_df.index.tz_localize("UTC")
