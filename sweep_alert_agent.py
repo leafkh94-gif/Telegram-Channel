@@ -28,10 +28,10 @@ SKILLS INTEGRATED:
 
 Run:  python sweep_alert_agent.py [--test | --once]
 Env:  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-Deps: pip install yfinance pandas requests
+Deps: pip install pandas requests
 """
 
-import os, sys, csv, json, time, math, random, traceback, threading, base64, socket
+import os, sys, csv, json, time, math, random, traceback, threading, base64
 from datetime import datetime, timedelta, timezone
 import requests, pandas as pd
 
@@ -45,7 +45,6 @@ SYMBOLS = {
     "NASDAQ": {"yf":"NQ=F",  "kind":"index", "cfd":"US100", "per_lot_per_pt":1.0,  "round_step":250.0},
     "DOW":    {"yf":"YM=F",  "kind":"index", "cfd":"US30",  "per_lot_per_pt":1.0,  "round_step":500.0},
 }
-DXY_YF = "DX-Y.NYB"
 ENABLE_SHORTS = True
 ENABLE_LONGS  = True
 
@@ -448,13 +447,6 @@ def is_choppy(m15c):
     if len(m15c)<30: return False
     return adx(m15c.tail(60),14)<18
 
-def dxy_state(m15_dxy):
-    if m15_dxy is None or len(m15_dxy)<10: return "flat"
-    c=m15_dxy["Close"]
-    roc=(float(c.iloc[-1])/float(c.iloc[-8])-1.0)*100.0
-    if roc>0.05: return "rising"
-    if roc<-0.05: return "falling"
-    return "flat"
 
 # =====================================================================================
 # Indicator confirmation score (Smart Trading Framework: RSI + MACD + EMA = 1 factor)
@@ -820,7 +812,7 @@ def detect_news_retest(name,cfg,m15c,atr15,side,now):
 # Unified confluence scoring (Smart Trading Framework)
 # =====================================================================================
 
-def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, dxy, now, flat_by, levels_opp):
+def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_by, levels_opp):
     """Add confluence factors to a raw candidate from any strategy detector."""
     side=raw["side"]; sgn=-1 if side=="short" else 1
     score=float(raw["base_score"])+float(raw.get("pattern_bonus",0))
@@ -844,11 +836,6 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, dxy, now, f
     elif 7.0<=hr<12.0: score+=6; reasons.append("London session")
 
     # ---- Additional confluence (not part of the 3-factor count) ---------------------
-    if cfg["kind"]=="gold":
-        if (side=="short" and dxy=="rising") or (side=="long" and dxy=="falling"):
-            score+=8; reasons.append(f"DXY {dxy} confluence")
-        elif dxy!="flat": score-=4; reasons.append(f"DXY {dxy} against")
-
     step=cfg["round_step"]; L=raw["level_price"]
     nearest_round=round(L/step)*step
     if abs(L-nearest_round)<=0.3*atr15:
@@ -1060,24 +1047,6 @@ def run_cycle(loop_mode):
         log("Daily risk limit reached."); return
     watch_only=is_watch_only(st)
 
-    # DXY — Yahoo Finance only (Capital.com doesn't carry DX-Y)
-    dxy = "flat"
-    try:
-        import yfinance as yf
-        _old_to = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(20)   # prevent yfinance hanging indefinitely
-        try:
-            dxy_df = yf.Ticker(DXY_YF).history(period="5d", interval="15m", auto_adjust=False)
-        finally:
-            socket.setdefaulttimeout(_old_to)
-        if dxy_df is not None and len(dxy_df) > 0:
-            dxy_df = dxy_df[["Open","High","Low","Close"]].dropna()
-            if dxy_df.index.tz is None: dxy_df.index = dxy_df.index.tz_localize("UTC")
-            else: dxy_df.index = dxy_df.index.tz_convert("UTC")
-            dxy = dxy_state(closed_bars(dxy_df, 15, now))
-    except Exception as e:
-        log(f"DXY fetch failed (non-critical): {e}")
-
     use_capital = _ensure_capital()
 
     all_candidates=[]; last_scores={}
@@ -1129,7 +1098,7 @@ def run_cycle(loop_mode):
             raws+=detect_flag(name,cfg,m15c,atr15,side)
             raws+=detect_news_retest(name,cfg,m15c,atr15,side,now)
             for raw in raws:
-                c=score_candidate(raw,cfg,name,m15c,atr15,atr1h,bias,dxy,now,hard_flat,opp)
+                c=score_candidate(raw,cfg,name,m15c,atr15,atr1h,bias,now,hard_flat,opp)
                 if c:
                     # penalize choppy markets (-10 score)
                     if choppy:
