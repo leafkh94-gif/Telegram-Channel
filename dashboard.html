@@ -11,6 +11,7 @@
   h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 4px; }
   .subtitle { color: #7d8590; font-size: 0.85rem; margin-bottom: 24px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .wide { grid-column: 1 / -1; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; }
   .card h2 { font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
               letter-spacing: .08em; color: #7d8590; margin-bottom: 14px; }
@@ -25,6 +26,7 @@
   .yellow { background: #3d2b00; color: #e3b341; }
   .red    { background: #4a1b1b; color: #f85149; }
   .grey   { background: #21262d; color: #8b949e; }
+  .blue   { background: #0d2a4a; color: #58a6ff; }
   .run-row { display: flex; align-items: center; gap: 10px; padding: 8px 0;
               border-bottom: 1px solid #21262d; font-size: 0.83rem; }
   .run-row:last-child { border-bottom: none; }
@@ -52,6 +54,16 @@
              border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .error-msg { color: #f85149; font-size: 0.82rem; margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { text-align: left; color: #7d8590; font-weight: 600; padding: 6px 8px;
+       border-bottom: 1px solid #30363d; }
+  td { padding: 7px 8px; border-bottom: 1px solid #21262d; }
+  tr:last-child td { border-bottom: none; }
+  .score-bar { display: inline-block; height: 6px; border-radius: 3px;
+               background: #3fb950; vertical-align: middle; margin-left: 6px; }
+  .score-high { background: #3fb950; }
+  .score-mid  { background: #e3b341; }
+  .score-low  { background: #8b949e; }
 </style>
 </head>
 <body>
@@ -61,10 +73,28 @@
 
 <div class="grid">
 
-  <!-- Live Run Status -->
+  <!-- Live Scan Status -->
+  <div class="card" id="card-status">
+    <h2>Last Scan</h2>
+    <div id="status-content"><span class="spinner"></span></div>
+  </div>
+
+  <!-- GitHub Actions Runs -->
   <div class="card" id="card-runs">
     <h2>GitHub Actions — Recent Runs</h2>
     <div id="runs-content"><span class="spinner"></span></div>
+  </div>
+
+  <!-- Last Scores per Instrument -->
+  <div class="card" id="card-scores">
+    <h2>Last Scan Scores</h2>
+    <div id="scores-content"><span class="spinner"></span></div>
+  </div>
+
+  <!-- Recent Alerts -->
+  <div class="card wide" id="card-alerts">
+    <h2>Recent Alerts Fired</h2>
+    <div id="alerts-content"><span class="spinner"></span></div>
   </div>
 
   <!-- Bot Configuration -->
@@ -196,6 +226,7 @@
 <script>
 const OWNER = 'leafkh94-gif';
 const REPO  = 'Telegram-Channel';
+const STATUS_URL = `https://raw.githubusercontent.com/${OWNER}/${REPO}/status/bot_status.json`;
 
 function fmtTime(iso) {
   const d = new Date(iso);
@@ -217,6 +248,85 @@ function runBadge(status, conclusion) {
   if (conclusion === 'failure') return '<span class="badge red">failed</span>';
   if (conclusion === 'cancelled') return '<span class="badge grey">cancelled</span>';
   return '<span class="badge grey">'+status+'</span>';
+}
+
+function scoreBar(score) {
+  const pct = Math.min(100, (score / 96) * 100);
+  const cls = score >= 75 ? 'score-high' : score >= 62 ? 'score-mid' : 'score-low';
+  return `<span class="score-bar ${cls}" style="width:${pct*0.8}px"></span>`;
+}
+
+function tierBadge(tier) {
+  if (tier === 'A+')    return '<span class="badge green">A+</span>';
+  if (tier === 'WATCH') return '<span class="badge yellow">WATCH</span>';
+  return '<span class="badge grey">—</span>';
+}
+
+async function loadStatus() {
+  const sEl = document.getElementById('status-content');
+  const scEl = document.getElementById('scores-content');
+  const aEl  = document.getElementById('alerts-content');
+  try {
+    const r = await fetch(STATUS_URL + '?t=' + Date.now());
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' — status file not yet created (bot hasn\'t run a full cycle since deploy)');
+    const d = await r.json();
+
+    // Last scan card
+    const ago = Math.round((Date.now() - new Date(d.scanned_at_utc + 'Z')) / 60000);
+    const marketBadge = d.market_open
+      ? '<span class="badge green">Open</span>'
+      : '<span class="badge red">Closed</span>';
+    sEl.innerHTML = `
+      <div class="stat"><span class="stat-label">Scanned at</span><span class="stat-value">${fmtTime(d.scanned_at_utc)} <span style="color:#7d8590;font-weight:400">(${ago}m ago)</span></span></div>
+      <div class="stat"><span class="stat-label">Market</span><span class="stat-value">${marketBadge}</span></div>
+      <div class="stat"><span class="stat-label">A+ sent today</span><span class="stat-value">${d.today.aplus_sent} / 4</span></div>
+      <div class="stat"><span class="stat-label">WATCH sent today</span><span class="stat-value">${d.today.watch_sent} / 1</span></div>
+      <div class="stat"><span class="stat-label">Setups evaluated</span><span class="stat-value">${d.today.evaluated}</span></div>
+      <div class="stat"><span class="stat-label">Current threshold</span><span class="stat-value">${d.today.threshold}</span></div>
+      <div class="stat"><span class="stat-label">Daily risk used</span><span class="stat-value">${d.today.daily_risk_exposure}%</span></div>
+      ${d.today.halted_until ? `<div class="stat"><span class="stat-label">Halted until</span><span class="stat-value"><span class="badge red">${d.today.halted_until}</span></span></div>` : ''}
+    `;
+
+    // Last scores card
+    const scores = d.last_scores || {};
+    const keys = Object.keys(scores);
+    if (!keys.length) {
+      scEl.innerHTML = '<p style="color:#7d8590;font-size:0.83rem">No scored candidates in last cycle.</p>';
+    } else {
+      scEl.innerHTML = '<table><thead><tr><th>Symbol</th><th>Score</th><th>Side</th><th>Strategy</th></tr></thead><tbody>' +
+        keys.sort().map(sym => {
+          const s = scores[sym];
+          return `<tr>
+            <td><strong>${sym}</strong></td>
+            <td>${s.score}${scoreBar(s.score)}</td>
+            <td><span class="badge ${s.side==='long'?'green':'red'}">${s.side}</span></td>
+            <td style="color:#8b949e">${s.strategy}</td>
+          </tr>`;
+        }).join('') + '</tbody></table>';
+    }
+
+    // Recent alerts card
+    const alerts = (d.recent_alerts || []).slice().reverse();
+    if (!alerts.length) {
+      aEl.innerHTML = '<p style="color:#7d8590;font-size:0.83rem">No alerts fired yet today.</p>';
+    } else {
+      aEl.innerHTML = '<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Score</th><th>Tier</th><th>Strategy</th><th>Entry</th><th>TP1</th><th>Stop</th></tr></thead><tbody>' +
+        alerts.map(a => `<tr>
+          <td style="color:#7d8590">${fmtTime(a.ts_utc)}</td>
+          <td><strong>${a.symbol}</strong></td>
+          <td><span class="badge ${a.side==='long'?'green':'red'}">${a.side}</span></td>
+          <td>${a.score}${scoreBar(parseFloat(a.score))}</td>
+          <td>${tierBadge(a.alerted)}</td>
+          <td style="color:#8b949e">${a.strategy}</td>
+          <td>${a.entry}</td>
+          <td>${a.tp1}</td>
+          <td>${a.stop}</td>
+        </tr>`).join('') + '</tbody></table>';
+    }
+  } catch(e) {
+    const msg = `<p class="error-msg">${e.message}</p>`;
+    sEl.innerHTML = msg; scEl.innerHTML = msg; aEl.innerHTML = msg;
+  }
 }
 
 async function loadRuns() {
@@ -244,33 +354,33 @@ async function loadRuns() {
 function updateMarketStatus() {
   const el = document.getElementById('market-status');
   const now = new Date();
-  const day = now.getUTCDay(); // 0=Sun, 5=Fri, 6=Sat
+  const day = now.getUTCDay();
   const h = now.getUTCHours() + now.getUTCMinutes() / 60;
 
-  let closed = false;
-  let reason = '';
-
+  let closed = false, reason = '';
   if (day === 6) { closed = true; reason = 'Weekend (closed until Sun 22:00 UTC)'; }
   else if (day === 0 && h < 22) { closed = true; reason = 'Weekend (opens Sun 22:00 UTC)'; }
   else if (day === 5 && h >= 21) { closed = true; reason = 'Weekly close (reopens Sun 22:00 UTC)'; }
   else if (h >= 21 && h < 22) { closed = true; reason = 'Daily maintenance (21:00–22:00 UTC)'; }
 
-  if (closed) {
-    el.innerHTML = `<span class="badge red">Closed</span> <small style="color:#7d8590">${reason}</small>`;
-  } else {
-    el.innerHTML = `<span class="badge green">Open</span>`;
-  }
+  el.innerHTML = closed
+    ? `<span class="badge red">Closed</span> <small style="color:#7d8590">${reason}</small>`
+    : `<span class="badge green">Open</span>`;
 }
 
 function refresh() {
   document.getElementById('runs-content').innerHTML = '<span class="spinner"></span>';
+  document.getElementById('status-content').innerHTML = '<span class="spinner"></span>';
+  document.getElementById('scores-content').innerHTML = '<span class="spinner"></span>';
+  document.getElementById('alerts-content').innerHTML = '<span class="spinner"></span>';
   loadRuns();
+  loadStatus();
   updateMarketStatus();
   document.getElementById('last-refresh').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
 }
 
 refresh();
-setInterval(refresh, 5 * 60 * 1000); // auto-refresh every 5 min
+setInterval(refresh, 5 * 60 * 1000);
 </script>
 </body>
 </html>

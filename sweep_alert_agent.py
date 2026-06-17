@@ -31,7 +31,7 @@ Env:  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 Deps: pip install yfinance pandas requests
 """
 
-import os, sys, csv, json, time, math, random, traceback, threading
+import os, sys, csv, json, time, math, random, traceback, threading, base64
 from datetime import datetime, timedelta, timezone
 import requests, pandas as pd
 
@@ -969,6 +969,58 @@ def alert_text(c,cfg,tier,now,st):
     return "\n".join(lines)
 
 # =====================================================================================
+# Status JSON — pushed to 'status' branch after every scan cycle
+# =====================================================================================
+
+STATUS_BRANCH = "status"
+STATUS_FILE   = "bot_status.json"
+
+def read_recent_alerts(n=10):
+    rows = []
+    try:
+        with open(SIGNALS_CSV, "r") as f:
+            for row in csv.DictReader(f):
+                if row.get("alerted") in ("A+", "WATCH"):
+                    rows.append({k: row.get(k, "") for k in
+                                 ("ts_utc","symbol","side","score","strategy",
+                                  "entry","tp1","stop","alerted")})
+    except Exception:
+        pass
+    return rows[-n:]
+
+def push_status_json(state, last_scores, now):
+    token = os.getenv("GITHUB_TOKEN")
+    repo  = os.getenv("GITHUB_REPOSITORY")
+    if not token or not repo:
+        return
+    payload = {
+        "scanned_at_utc": now.isoformat(timespec="seconds"),
+        "market_open": not is_market_closed(now),
+        "today": {
+            "aplus_sent":          state.get("aplus_sent", 0),
+            "watch_sent":          state.get("watch_sent", 0),
+            "evaluated":           state.get("evaluated", 0),
+            "threshold":           state.get("threshold", SCORE_A_PLUS),
+            "daily_risk_exposure": round(float(state.get("daily_risk_exposure", 0)), 2),
+            "halted_until":        state.get("halted_until"),
+        },
+        "last_scores":   last_scores,
+        "recent_alerts": read_recent_alerts(),
+    }
+    content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
+    url     = f"https://api.github.com/repos/{repo}/contents/{STATUS_FILE}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    try:
+        r   = requests.get(url, headers=headers, params={"ref": STATUS_BRANCH}, timeout=10)
+        sha = r.json().get("sha") if r.ok else None
+        body = {"message": f"status {now.strftime('%H:%M UTC')}", "content": content_b64, "branch": STATUS_BRANCH}
+        if sha:
+            body["sha"] = sha
+        requests.put(url, headers=headers, json=body, timeout=10)
+    except Exception as e:
+        log(f"push_status_json failed (non-critical): {e}")
+
+# =====================================================================================
 # Scan cycle — runs all 5 strategies per instrument
 # =====================================================================================
 
@@ -1023,7 +1075,7 @@ def run_cycle(loop_mode):
 
     use_capital = _ensure_capital()
 
-    all_candidates=[]
+    all_candidates=[]; last_scores={}
     for name,cfg in SYMBOLS.items():
         time.sleep(2)
         try:
@@ -1080,6 +1132,10 @@ def run_cycle(loop_mode):
                         c["reasons"].append("choppy market (-10)")
                     st["evaluated"]=st.get("evaluated",0)+1
                     all_candidates.append((c,cfg))
+                    # track best score per symbol for status dashboard
+                    prev=last_scores.get(name,{})
+                    if c["score"]>prev.get("score",0):
+                        last_scores[name]={"score":round(c["score"],1),"side":c["side"],"strategy":c["strategy"]}
 
     # US Index Consensus Filter (Trading Bot Strategy Section 8)
     # If 2+ US indices fire signals, suppress any that contradict the consensus
@@ -1095,7 +1151,9 @@ def run_cycle(loop_mode):
             dropped=before-len(all_candidates)
             if dropped: log(f"Consensus filter: dropped {dropped} index signal(s) contradicting {consensus_side}")
 
-    if not all_candidates: save_state(st); return
+    if not all_candidates:
+        push_status_json(st, last_scores, now)
+        save_state(st); return
     all_candidates.sort(key=lambda x:-x[0]["score"])
     threshold=float(st.get("threshold",SCORE_A_PLUS))
 
@@ -1139,6 +1197,7 @@ def run_cycle(loop_mode):
                 "level_price":round(c["level_price"],2),
                 "reasons":" | ".join(c["reasons"]),"alerted":c.get("alerted",""),
                 "outcome":"","exit_price":"","pnl_usd":"","hold_minutes":"","lessons":""})
+    push_status_json(st, last_scores, now)
     save_state(st)
 
 # =====================================================================================
