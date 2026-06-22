@@ -64,7 +64,7 @@ MAX_HOLD_HOURS=4.0; SCAN_EVERY_MIN=15
 # ---- Alert controls -----------------------------------------------------------------
 SCORE_A_PLUS=75; SCORE_A_PLUS_FLOOR=65; SCORE_A_PLUS_CEIL=85
 ADAPTIVE_THRESHOLD=True; SILENT_DAYS_TO_ADAPT=3
-SCORE_WATCH=62; MAX_APLUS_PER_DAY=4; MAX_WATCH_PER_DAY=1
+SCORE_WATCH=62; MAX_APLUS_PER_DAY=4; MAX_WATCH_PER_DAY=999
 COOLDOWN_MIN_PER_SYMBOL=90; MIN_GAP_BETWEEN_ALERTS=30
 
 # ---- Risk (playbook S3 + risk-management skill) ------------------------------------
