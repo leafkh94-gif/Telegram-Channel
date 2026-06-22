@@ -62,17 +62,24 @@ HARD_FLAT_UTC="20:45"   # force-flat 15 min before daily close
 MAX_HOLD_HOURS=4.0; SCAN_EVERY_MIN=15
 
 # ---- Alert controls -----------------------------------------------------------------
-# العتبة التكيفية (Adaptive Threshold)
-# ─────────────────────────────────────
-# العتبة الأساسية لإشارة A+ هي 75 نقطة. لكن البوت يضبطها تلقائياً يومياً:
+# ── Adaptive Threshold ────────────────────────────────────────────────────────────────
+# The base A+ threshold is 75 points. But the bot adjusts it automatically each day:
 #
-#  • إذا مرت 3 أيام متتالية بدون إشارات A+   → تنزل العتبة 2 نقطة (حد أدنى 65)
-#    (السوق هادئ — نقبل إشارات أقل قوة شوية)
-#  • إذا وصلت إشارات A+ للحد الأقصى (4/يوم)  → ترتفع العتبة نقطة واحدة (حد أقصى 85)
-#    (السوق نشط — نكون أكثر انتقائية)
-#  • إذا تراكمت 3 خسائر متتالية               → ترتفع العتبة 5 نقاط إضافية
-#    (حماية رأس المال — نشترط جودة أعلى بعد الخسائر)
+#   • 3 consecutive days with no A+ signals  → threshold drops by 2 pts (floor: 65)
+#     "Market is slow — accept slightly lower-scoring setups"
 #
+#   • Daily A+ cap reached (4 alerts/day)    → threshold rises by 1 pt next day (ceil: 85)
+#     "Market is noisy — be more selective"
+#
+#   • 3 consecutive losses                   → threshold rises by 5 pts (ceil: 85)
+#     "Protect capital — require higher quality after a loss streak"
+#
+# Goal: at least one quality alert per day — no total silence, no noise flood.
+#
+# العتبة التكيفية (بالعربي):
+#  • 3 أيام بلا إشارات A+ → تنزل العتبة 2 نقطة (حد أدنى 65)
+#  • وصول الحد الأقصى (4 إشارات/يوم) → ترتفع نقطة واحدة (حد أقصى 85)
+#  • 3 خسائر متتالية → ترتفع 5 نقاط إضافية
 # الهدف: تنبيهات بجودة معقولة كل يوم — لا صمت تام ولا فوضى.
 SCORE_A_PLUS=75; SCORE_A_PLUS_FLOOR=65; SCORE_A_PLUS_CEIL=85
 ADAPTIVE_THRESHOLD=True; SILENT_DAYS_TO_ADAPT=3
