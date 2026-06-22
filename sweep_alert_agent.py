@@ -100,11 +100,6 @@ TP1_RR=2.0; TP2_RR=3.0; TRAIL_ATR_MULT=2.5; TIME_STOP_HOURS=3.0
 # ---- Stop randomization (exit-strategies) -------------------------------------------
 STOP_RANDOMIZE=True; STOP_RAND_MIN=0.05; STOP_RAND_MAX=0.15
 
-# ---- Circuit breakers (risk-management) ---------------------------------------------
-CONSEC_LOSS_REDUCE=3; CONSEC_LOSS_MIN_SIZE=5; CONSEC_LOSS_HALT=7
-DAILY_LOSS_LIMIT_PCT=3.0; WEEKLY_LOSS_LIMIT_PCT=5.0
-THREE_DAILY_LIMITS_HALT=True
-
 # ---- News blackout ------------------------------------------------------------------
 RECURRING_BLACKOUTS_UTC=[("12:25","13:05"),("13:25","14:05")]
 EXTRA_BLACKOUTS_UTC=[]
@@ -281,15 +276,13 @@ def tg_send(text):
     except requests.RequestException: return False
 
 # =====================================================================================
-# State + Circuit Breakers (risk-management skill — unchanged from v2)
+# State
 # =====================================================================================
 
 def default_state(today_str,threshold):
     return {"date":today_str,"threshold":threshold,"silent_days":0,"aplus_sent":0,
             "watch_sent":0,"last_alert_ts":{},"last_any_alert_ts":None,"sent_keys":[],
-            "best_today":None,"digest_sent":False,"evaluated":0,
-            "consecutive_losses":0,"daily_risk_exposure":0.0,
-            "weekly_risk_exposure":0.0,"halted_until":None,"daily_limit_streak":0}
+            "best_today":None,"digest_sent":False,"evaluated":0}
 
 def load_state():
     today_str=now_utc().date().isoformat()
@@ -300,25 +293,13 @@ def load_state():
     if st.get("date")!=today_str:
         thr=float(st.get("threshold",SCORE_A_PLUS))
         silent=int(st.get("silent_days",0))
-        dls=int(st.get("daily_limit_streak",0))
-        if st.get("daily_risk_exposure",0)>=DAILY_LOSS_LIMIT_PCT: dls+=1
-        else: dls=0
         if st.get("aplus_sent",0)==0 and st.get("watch_sent",0)==0: silent+=1
         else: silent=0
         if ADAPTIVE_THRESHOLD:
             if silent>=SILENT_DAYS_TO_ADAPT: thr=max(SCORE_A_PLUS_FLOOR,thr-2); silent=0
             elif st.get("aplus_sent",0)>=MAX_APLUS_PER_DAY: thr=min(SCORE_A_PLUS_CEIL,thr+1)
-        consec=int(st.get("consecutive_losses",0))
-        if consec>=CONSEC_LOSS_REDUCE: thr=min(SCORE_A_PLUS_CEIL,thr+5)
         ns=default_state(today_str,thr)
-        ns["silent_days"]=silent; ns["consecutive_losses"]=consec
-        ns["weekly_risk_exposure"]=float(st.get("weekly_risk_exposure",0))
-        ns["daily_limit_streak"]=dls
-        if now_utc().weekday()==0: ns["weekly_risk_exposure"]=0.0; ns["daily_limit_streak"]=0
-        if THREE_DAILY_LIMITS_HALT and dls>=3:
-            ns["halted_until"]=(now_utc()+timedelta(days=2)).date().isoformat()
-        if consec>=CONSEC_LOSS_HALT:
-            ns["halted_until"]=(now_utc()+timedelta(hours=24)).isoformat()
+        ns["silent_days"]=silent
         return ns
     return st
 
@@ -326,19 +307,6 @@ def save_state(st):
     try:
         with open(STATE_FILE,"w") as f: json.dump(st,f,indent=2)
     except OSError: pass
-
-def is_halted(st):
-    h=st.get("halted_until")
-    if not h: return False
-    try:
-        if "T" in h: return now_utc()<datetime.fromisoformat(h)
-        return now_utc().date().isoformat()<=h
-    except: return False
-
-def is_watch_only(st):
-    if int(st.get("consecutive_losses",0))>=CONSEC_LOSS_MIN_SIZE: return True
-    if float(st.get("weekly_risk_exposure",0))>=WEEKLY_LOSS_LIMIT_PCT: return True
-    return False
 
 def read_outcomes():
     if not os.path.exists(SIGNALS_CSV): return []
@@ -959,9 +927,6 @@ def alert_text(c,cfg,tier,now,st):
     arrow="SHORT" if c["side"]=="short" else "LONG"
     head="A+ SETUP" if tier=="A+" else "WATCH (heads-up only)"
     hold_to=min(now+timedelta(hours=MAX_HOLD_HOURS),c["flat_by"])
-    cb=""
-    consec=int(st.get("consecutive_losses",0))
-    if consec>=CONSEC_LOSS_REDUCE: cb=f"\n⚠ CAUTION: {consec} consecutive losses — reduce size"
     lines=[
         f"[{head}] {arrow} {c['symbol']} ({cfg['cfd']}) — score {c['score']:.0f}/100",
         STRAT_LABELS.get(c["strategy"],c["strategy"]),
@@ -979,7 +944,6 @@ def alert_text(c,cfg,tier,now,st):
         "",
         "Why: "+"; ".join(c["reasons"]),
     ]
-    if cb: lines.append(cb)
     lines+=["","Survival > Capital > Growth","Mark W/L in signals_log.csv"]
     return "\n".join(lines)
 
@@ -1016,9 +980,7 @@ def push_status_json(state, last_scores, now):
             "watch_sent":          state.get("watch_sent", 0),
             "evaluated":           state.get("evaluated", 0),
             "threshold":           state.get("threshold", SCORE_A_PLUS),
-            "daily_risk_exposure": round(float(state.get("daily_risk_exposure", 0)), 2),
-            "halted_until":        state.get("halted_until"),
-        },
+            },
         "last_scores":   last_scores,
         "recent_alerts": read_recent_alerts(),
     }
@@ -1045,10 +1007,7 @@ def run_cycle(loop_mode):
         if loop_mode: log(f"Market closed ({now.strftime('%A %H:%M')} UTC).")
         return
     st=load_state()
-    if is_halted(st):
-        log(f"HALTED until {st.get('halted_until')}."); return
     outcomes=read_outcomes()
-    if outcomes: st["consecutive_losses"]=count_consec_losses(outcomes)
     # Hard flat = 15 min before daily close (21:00 UTC)
     hard_flat=hhmm_today(now,HARD_FLAT_UTC)
 
@@ -1064,16 +1023,12 @@ def run_cycle(loop_mode):
             ws=f"\nRecent ({t}): WR {wins/t*100:.0f}% | streak: {count_consec_losses(outcomes)} L"
         tg_send(f"Daily digest v3.0\nA+: {st.get('aplus_sent',0)} | WATCH: {st.get('watch_sent',0)} | "
                 f"evaluated: {st.get('evaluated',0)}\n{bt}\n"
-                f"Threshold: {st.get('threshold',SCORE_A_PLUS):.0f}\n"
-                f"Risk: {st.get('daily_risk_exposure',0):.1f}% day / {st.get('weekly_risk_exposure',0):.1f}% week"
+                f"Threshold: {st.get('threshold',SCORE_A_PLUS):.0f}"
                 f"{ws}\nA no-trade day is a winning day.")
         st["digest_sent"]=True; save_state(st); return
 
     if in_blackout(now):
         log("News blackout."); return
-    if float(st.get("daily_risk_exposure",0))>=DAILY_LOSS_LIMIT_PCT:
-        log("Daily risk limit reached."); return
-    watch_only=is_watch_only(st)
 
     use_capital = _ensure_capital()
 
@@ -1178,7 +1133,7 @@ def run_cycle(loop_mode):
         if last_any and (now-datetime.fromisoformat(last_any))<timedelta(minutes=MIN_GAP_BETWEEN_ALERTS): continue
 
         tier=None
-        if not watch_only and c["score"]>=threshold and st.get("aplus_sent",0)<MAX_APLUS_PER_DAY: tier="A+"
+        if c["score"]>=threshold and st.get("aplus_sent",0)<MAX_APLUS_PER_DAY: tier="A+"
         elif SCORE_WATCH<=c["score"] and st.get("watch_sent",0)<MAX_WATCH_PER_DAY: tier="WATCH"
         if tier is None: continue
 
@@ -1190,8 +1145,6 @@ def run_cycle(loop_mode):
             st["last_any_alert_ts"]=now.isoformat()
             if tier=="A+":
                 st["aplus_sent"]=st.get("aplus_sent",0)+1
-                st["daily_risk_exposure"]=float(st.get("daily_risk_exposure",0))+RISK_PCT
-                st["weekly_risk_exposure"]=float(st.get("weekly_risk_exposure",0))+RISK_PCT
             else: st["watch_sent"]=st.get("watch_sent",0)+1
 
     for c,cfg in all_candidates:
@@ -1225,7 +1178,7 @@ def self_test():
                 "1. Zone Rejection\n2. Liquidity Sweep\n3. Double Top/Bottom\n"
                 "4. Bear/Bull Flag\n5. Post-News Retest\n"
                 f"Window: Sun 22:00–Fri 21:00 UTC, daily close 21:00–22:00 UTC\n"
-                f"Circuit breakers: {CONSEC_LOSS_REDUCE}/{CONSEC_LOSS_MIN_SIZE}/{CONSEC_LOSS_HALT}")
+                )
 
 def main():
     args=set(a.lower() for a in sys.argv[1:])
@@ -1236,7 +1189,7 @@ def main():
         return
     log(f"v3.0 loop: {SCAN_EVERY_MIN}min, 5 strategies, Sun 22:00–Fri 21:00 UTC")
     tg_send(f"Agent v3.0 online — 5 strategies × {len(SYMBOLS)} instruments\n"
-            f"Every {SCAN_EVERY_MIN}min | max {MAX_APLUS_PER_DAY} A+/day | circuit breakers ON")
+            f"Every {SCAN_EVERY_MIN}min | max {MAX_APLUS_PER_DAY} A+/day")
     while True:
         try: run_cycle(True)
         except: log("Crash (alive):\n"+traceback.format_exc())
