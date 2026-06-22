@@ -283,8 +283,6 @@ async function loadStatus() {
       <div class="stat"><span class="stat-label">WATCH sent today</span><span class="stat-value">${d.today.watch_sent} / 1</span></div>
       <div class="stat"><span class="stat-label">Setups evaluated</span><span class="stat-value">${d.today.evaluated}</span></div>
       <div class="stat"><span class="stat-label">Current threshold</span><span class="stat-value">${d.today.threshold}</span></div>
-      <div class="stat"><span class="stat-label">Daily risk used</span><span class="stat-value">${d.today.daily_risk_exposure}%</span></div>
-      ${d.today.halted_until ? `<div class="stat"><span class="stat-label">Halted until</span><span class="stat-value"><span class="badge red">${d.today.halted_until}</span></span></div>` : ''}
     `;
 
     // Last scores card
