@@ -40,10 +40,14 @@ import requests, pandas as pd
 # =====================================================================================
 
 SYMBOLS = {
-    "GOLD":   {"yf":"GC=F",  "kind":"gold",  "cfd":"XAUUSD","per_lot_per_pt":100.0,"round_step":50.0},
-    "SP500":  {"yf":"ES=F",  "kind":"index", "cfd":"US500", "per_lot_per_pt":1.0,  "round_step":100.0},
-    "NASDAQ": {"yf":"NQ=F",  "kind":"index", "cfd":"US100", "per_lot_per_pt":1.0,  "round_step":250.0},
-    "DOW":    {"yf":"YM=F",  "kind":"index", "cfd":"US30",  "per_lot_per_pt":1.0,  "round_step":500.0},
+    "GOLD":   {"yf":"GC=F",  "kind":"gold",  "cfd":"XAUUSD","per_lot_per_pt":100.0,"round_step":50.0,
+               "session_bonus":{"london":8,"ny":8},  "atr_sl_max":1.5,"atr_sl_min":0.40},
+    "SP500":  {"yf":"ES=F",  "kind":"index", "cfd":"US500", "per_lot_per_pt":1.0,  "round_step":100.0,
+               "session_bonus":{"london":4,"ny":10}, "atr_sl_max":1.8,"atr_sl_min":0.50},
+    "NASDAQ": {"yf":"NQ=F",  "kind":"index", "cfd":"US100", "per_lot_per_pt":1.0,  "round_step":250.0,
+               "session_bonus":{"london":3,"ny":10}, "atr_sl_max":2.0,"atr_sl_min":0.55},
+    "DOW":    {"yf":"YM=F",  "kind":"index", "cfd":"US30",  "per_lot_per_pt":1.0,  "round_step":500.0,
+               "session_bonus":{"london":4,"ny":10}, "atr_sl_max":1.8,"atr_sl_min":0.50},
 }
 ENABLE_SHORTS = True
 ENABLE_LONGS  = True
@@ -830,10 +834,12 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
     elif bias=="neutral": score+=5
     else: score-=8; reasons.append(f"counter-trend vs HTF {bias} (-8)")
 
-    # Factor 3: Session timing
+    # Factor 3: Session timing (per-instrument weights)
     hr=now.hour+now.minute/60.0
-    if 12.0<=hr<16.0: score+=10; reasons.append("NY overlap")
-    elif 7.0<=hr<12.0: score+=6; reasons.append("London session")
+    sb=cfg.get("session_bonus",{"london":6,"ny":10})
+    if 12.5<=hr<16.0: score+=sb["ny"]; reasons.append("NY session")
+    elif 7.0<=hr<12.5: score+=sb["london"]; reasons.append("London session")
+    elif 0.0<=hr<7.0: score+=2; reasons.append("Asia session")
 
     # ---- Additional confluence (not part of the 3-factor count) ---------------------
     step=cfg["round_step"]; L=raw["level_price"]
@@ -853,15 +859,18 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
     if raw["strategy"]=="liquidity-sweep":
         extreme=raw.get("extreme",stop_raw)
         entry=0.5*(extreme+float(m15c["Close"].iloc[-1]))
+        sl_max=cfg.get("atr_sl_max",STOP_ATR_MULT_MAX)
         if side=="short":
             stop=extreme+STOP_BUFFER_ATR*atr15+rand_off
-            entry=max(entry,stop-0.95*STOP_ATR_MULT_MAX*atr15)
+            entry=max(entry,stop-0.95*sl_max*atr15)
         else:
             stop=extreme-STOP_BUFFER_ATR*atr15-rand_off
-            entry=min(entry,stop+0.95*STOP_ATR_MULT_MAX*atr15)
+            entry=min(entry,stop+0.95*sl_max*atr15)
 
+    sl_max=cfg.get("atr_sl_max",STOP_ATR_MULT_MAX)
+    sl_min=cfg.get("atr_sl_min",STOP_ATR_MULT_MIN)
     risk=abs(stop-entry)
-    if risk<=0 or risk>STOP_ATR_MULT_MAX*atr15 or risk<STOP_ATR_MULT_MIN*atr15:
+    if risk<=0 or risk>sl_max*atr15 or risk<sl_min*atr15:
         return None
 
     tp1=entry+sgn*TP1_RR*risk
@@ -1124,6 +1133,14 @@ def run_cycle(loop_mode):
                             if cfg["kind"]!="index" or c["side"]==consensus_side or c["score"]<SCORE_WATCH]
             dropped=before-len(all_candidates)
             if dropped: log(f"Consensus filter: dropped {dropped} index signal(s) contradicting {consensus_side}")
+
+    # Correlation cap: max 1 index alert per cycle (US500/US100/US30 share same tech stocks)
+    idx_qualifying=[(c,cf) for c,cf in all_candidates if cf["kind"]=="index" and c["score"]>=SCORE_WATCH]
+    if len(idx_qualifying)>1:
+        best_idx=max(idx_qualifying,key=lambda x:x[0]["score"])
+        all_candidates=[(c,cf) for c,cf in all_candidates
+                        if cf["kind"]!="index" or c["score"]<SCORE_WATCH or (c,cf)==best_idx]
+        log(f"Correlation cap: kept only top index signal ({best_idx[0]['symbol']} {best_idx[0]['score']:.0f})")
 
     if not all_candidates:
         push_status_json(st, last_scores, now)
