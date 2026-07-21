@@ -264,6 +264,67 @@ def recently_exited_blackout(now, minutes=45):
             return True
     return False
 
+# =====================================================================================
+# Live economic calendar (free, no API key) — real high-impact USD events
+# =====================================================================================
+# The fixed RECURRING_BLACKOUTS_UTC above are a rough guess at data-release times.
+# This layer pulls the actual weekly calendar so the bot (a) pauses around real
+# high-impact USD events (which drive gold AND the US indices), and (b) can name
+# the real event in Post-News Retest alerts. If the feed is unreachable, everything
+# falls back gracefully to the fixed windows — no crash, no missed scans.
+
+ECON_CAL_URL   = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_BUFFER_MIN = 30    # pause this many minutes before AND after a high-impact event
+_econ_cache = {"fetched": None, "events": []}
+
+def _parse_econ_dt(s):
+    try:
+        dt=datetime.fromisoformat(s)
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _fetch_econ_calendar():
+    try:
+        r=requests.get(ECON_CAL_URL, timeout=_CAP_TIMEOUT,
+                       headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        events=[]
+        for e in r.json():
+            if str(e.get("impact","")).lower()!="high":
+                continue
+            if str(e.get("country","")).upper()!="USD":   # USD drives gold + US indices
+                continue
+            dt=_parse_econ_dt(e.get("date"))
+            if dt: events.append({"title": str(e.get("title","event")), "time": dt})
+        return events
+    except Exception:
+        return None
+
+def get_econ_events(now):
+    """Cached high-impact USD events for the week; refreshed every 6h."""
+    if _econ_cache["fetched"] is None or (now-_econ_cache["fetched"])>timedelta(hours=6):
+        ev=_fetch_econ_calendar()
+        if ev is not None:
+            _econ_cache["events"]=ev; _econ_cache["fetched"]=now
+    return _econ_cache["events"]
+
+def in_econ_blackout(now):
+    """Return the event title if we're within NEWS_BUFFER_MIN of a high-impact event."""
+    for e in get_econ_events(now):
+        if abs((now-e["time"]).total_seconds())<=NEWS_BUFFER_MIN*60:
+            return e["title"]
+    return None
+
+def recent_econ_event(now, minutes=45):
+    """Return the title of a high-impact event that fired within the last N minutes."""
+    best=None
+    for e in get_econ_events(now):
+        d=(now-e["time"]).total_seconds()
+        if 0<=d<=minutes*60: best=e["title"]
+    return best
+
 def tg_send(text):
     token=os.environ.get("TELEGRAM_BOT_TOKEN","").strip()
     chat=os.environ.get("TELEGRAM_CHAT_ID","").strip()
@@ -326,6 +387,21 @@ def count_consec_losses(outcomes):
         else: break
     return c
 
+def strategy_winrates():
+    """Return {strategy: (wins, total)} from all graded W/L signals."""
+    stats={}
+    if not os.path.exists(SIGNALS_CSV): return stats
+    try:
+        with open(SIGNALS_CSV,"r") as f:
+            for row in csv.DictReader(f):
+                if row.get("alerted") in ("A+","WATCH") and row.get("outcome") in ("W","L"):
+                    strat=row.get("strategy","?")
+                    w,t=stats.get(strat,(0,0))
+                    stats[strat]=(w+(1 if row["outcome"]=="W" else 0), t+1)
+    except Exception:
+        pass
+    return stats
+
 # =====================================================================================
 # CSV logging (trade-journal 18-field)
 # =====================================================================================
@@ -343,6 +419,84 @@ def log_csv(row):
             if new: w.writeheader()
             w.writerow(row)
     except: pass
+
+# =====================================================================================
+# Automatic outcome tracking — grade past alerts as W / L / N against later price
+# =====================================================================================
+# The bot is alert-only (no live account), so nothing reports back whether a signal
+# won or lost. This closes that loop: a few hours after each alert we replay the
+# 15-minute candles and check what price hit first — the target (TP1 → Win) or the
+# stop (→ Loss). Neither within the window → N (expired). Results feed the daily
+# digest win-rate and per-strategy stats. Purely observational; never trades.
+
+EVAL_HORIZON_HOURS = 4.0   # how long a signal has to reach TP1 before it's graded
+
+def _parse_ts(s):
+    if not s: return None
+    try:
+        dt=datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def _first_hit(window, side, stop, tp1):
+    """Scan candles in time order; return 'W', 'L', or 'N'.
+    If a single candle straddles both levels, grade conservatively as a loss."""
+    for _,b in window.iterrows():
+        hi=float(b["High"]); lo=float(b["Low"])
+        hit_stop = lo<=stop if side=="long" else hi>=stop
+        hit_tp   = hi>=tp1  if side=="long" else lo<=tp1
+        if hit_stop: return "L"      # stop checked first = conservative
+        if hit_tp:   return "W"
+    return "N"
+
+def _rewrite_signals(rows):
+    try:
+        with open(SIGNALS_CSV,"w",newline="") as f:
+            w=csv.DictWriter(f,fieldnames=CSV_FIELDS,extrasaction="ignore",restval="")
+            w.writeheader()
+            for r in rows: w.writerow(r)
+    except OSError: pass
+
+def evaluate_pending_outcomes(now, use_capital):
+    """Grade any alerted signals older than EVAL_HORIZON_HOURS that have no outcome yet."""
+    if not use_capital or not os.path.exists(SIGNALS_CSV):
+        return
+    try:
+        with open(SIGNALS_CSV,"r") as f: rows=list(csv.DictReader(f))
+    except Exception:
+        return
+    pending=[]
+    for r in rows:
+        if r.get("alerted") not in ("A+","WATCH") or r.get("outcome"):
+            continue
+        ts=_parse_ts(r.get("ts_utc"))
+        if ts and (now-ts)>=timedelta(hours=EVAL_HORIZON_HOURS):
+            pending.append(r)
+    if not pending:
+        return
+    price_cache={}; changed=False
+    for r in pending:
+        sym=r.get("symbol")
+        if sym not in CAPITAL_EPICS: continue
+        df=price_cache.get(sym)
+        if df is None:
+            try: df=_cap_fetch(CAPITAL_EPICS[sym],"15m",400)
+            except Exception: df=None
+            price_cache[sym]=df
+        if df is None or len(df)==0: continue
+        ts=_parse_ts(r.get("ts_utc"))
+        try:
+            stop=float(r["stop"]); tp1=float(r["tp1"]); side=r["side"]
+        except (KeyError,ValueError,TypeError):
+            continue
+        window=df[(df.index>ts)&(df.index<=ts+timedelta(hours=EVAL_HORIZON_HOURS))]
+        if len(window)==0: continue
+        r["outcome"]=_first_hit(window,side,stop,tp1); changed=True
+    if changed:
+        graded=sum(1 for r in pending if r.get("outcome"))
+        _rewrite_signals(rows)
+        log(f"Outcome tracking: graded {graded} past signal(s).")
 
 # =====================================================================================
 # Data layer
@@ -768,9 +922,12 @@ def detect_flag(name,cfg,m15c,atr15,side):
 # =====================================================================================
 
 def detect_news_retest(name,cfg,m15c,atr15,side,now):
-    """After a news blackout ends, check if a big move happened and price is retesting."""
-    if not recently_exited_blackout(now, minutes=45): return []
+    """After a news event, check if a big move happened and price is retesting.
+    Triggers after a fixed blackout window OR a real high-impact USD event."""
+    econ_evt=recent_econ_event(now, minutes=45)
+    if not recently_exited_blackout(now, minutes=45) and not econ_evt: return []
     if len(m15c)<10: return []
+    evt_tag=f" after {econ_evt}" if econ_evt else ""
     close=float(m15c["Close"].iloc[-1])
 
     # find the largest candle in the last 6 bars (the news bar)
@@ -788,7 +945,7 @@ def detect_news_retest(name,cfg,m15c,atr15,side,now):
                      "entry":close,"stop":retest_level+0.5*atr15,
                      "level_name":"post-news retest","level_price":retest_level,
                      "base_score":34,"pattern_bonus":min(8,int(max_rng/atr15*3)),
-                     "reasons":[f"post-news bearish move ({max_rng:.1f}pts), retesting {retest_level:.2f}"]}]
+                     "reasons":[f"post-news bearish move{evt_tag} ({max_rng:.1f}pts), retesting {retest_level:.2f}"]}]
     elif side=="long" and float(news_bar["Close"])>float(news_bar["Open"]):
         retest_level=float(news_bar["Open"])
         if abs(close-retest_level)<0.5*atr15:
@@ -796,7 +953,7 @@ def detect_news_retest(name,cfg,m15c,atr15,side,now):
                      "entry":close,"stop":retest_level-0.5*atr15,
                      "level_name":"post-news retest","level_price":retest_level,
                      "base_score":34,"pattern_bonus":min(8,int(max_rng/atr15*3)),
-                     "reasons":[f"post-news bullish move ({max_rng:.1f}pts), retesting {retest_level:.2f}"]}]
+                     "reasons":[f"post-news bullish move{evt_tag} ({max_rng:.1f}pts), retesting {retest_level:.2f}"]}]
     return []
 
 # =====================================================================================
@@ -1021,6 +1178,11 @@ def run_cycle(loop_mode):
         if outcomes:
             r=outcomes[-20:]; wins=r.count("W"); t=len(r)
             ws=f"\nRecent ({t}): WR {wins/t*100:.0f}% | streak: {count_consec_losses(outcomes)} L"
+            sw=strategy_winrates()
+            if sw:
+                parts=[f"{s.split(':')[0] if ':' in s else s}: {w}/{tt} ({w/tt*100:.0f}%)"
+                       for s,(w,tt) in sorted(sw.items(),key=lambda x:-x[1][1])]
+                ws+="\nBy strategy: "+" | ".join(parts)
         tg_send(f"Daily digest v3.0\nA+: {st.get('aplus_sent',0)} | WATCH: {st.get('watch_sent',0)} | "
                 f"evaluated: {st.get('evaluated',0)}\n{bt}\n"
                 f"Threshold: {st.get('threshold',SCORE_A_PLUS):.0f}"
@@ -1031,6 +1193,14 @@ def run_cycle(loop_mode):
         log("News blackout."); return
 
     use_capital = _ensure_capital()
+
+    # Live economic calendar: pause around real high-impact USD events
+    econ_evt=in_econ_blackout(now)
+    if econ_evt:
+        log(f"Econ blackout: high-impact event '{econ_evt}' within {NEWS_BUFFER_MIN}min."); return
+
+    # Grade past alerts (W/L/N) against later price so the digest shows a real win-rate
+    evaluate_pending_outcomes(now, use_capital)
 
     all_candidates=[]; last_scores={}
     for name,cfg in SYMBOLS.items():
