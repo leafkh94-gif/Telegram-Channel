@@ -957,6 +957,37 @@ def detect_news_retest(name,cfg,m15c,atr15,side,now):
     return []
 
 # =====================================================================================
+# Fibonacci retracement confluence
+# =====================================================================================
+# Measure the most recent swing (high↔low over FIB_LOOKBACK M15 bars) and check
+# whether the setup's level sits on a key retracement. The 0.5–0.618 "golden zone"
+# is where institutional pullbacks most often reverse, so it earns more points.
+
+FIB_LOOKBACK = 60
+FIB_LEVELS   = [0.382, 0.5, 0.618, 0.786]
+
+def fib_confluence(m15c, atr15, price, lookback=FIB_LOOKBACK):
+    """Return (points, reason) if `price` sits near a key Fibonacci level."""
+    if m15c is None or len(m15c) < lookback or atr15 <= 0:
+        return 0, None
+    seg=m15c.tail(lookback)
+    hi=float(seg["High"].max()); lo=float(seg["Low"].min())
+    rng=hi-lo
+    if rng <= 0:
+        return 0, None
+    tol=0.35*atr15
+    best=None; best_dist=None
+    for f in FIB_LEVELS:
+        lv=hi-f*rng                     # retracement level from the swing high
+        d=abs(price-lv)
+        if best_dist is None or d<best_dist:
+            best_dist=d; best=f; best_lv=lv
+    if best_dist is not None and best_dist<=tol:
+        pts=8 if best in (0.5, 0.618) else 5   # golden zone worth more
+        return pts, f"at fib {best*100:.1f}% ({best_lv:.2f})"
+    return 0, None
+
+# =====================================================================================
 # Unified confluence scoring (Smart Trading Framework)
 # =====================================================================================
 
@@ -990,6 +1021,11 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
     nearest_round=round(L/step)*step
     if abs(L-nearest_round)<=0.3*atr15:
         score+=5; reasons.append(f"round number {nearest_round:.0f}")
+
+    # Fibonacci retracement confluence (golden zone 0.5–0.618 rewarded more)
+    fib_pts,fib_reason=fib_confluence(m15c,atr15,L)
+    if fib_pts:
+        score+=fib_pts; reasons.append(fib_reason)
 
     # ---- Finalize entry / stop / risk / targets -------------------------------------
     entry=raw["entry"]; stop_raw=raw["stop"]
@@ -1101,7 +1137,7 @@ def alert_text(c,cfg,tier,now,st):
         "",
         "Why: "+"; ".join(c["reasons"]),
     ]
-    lines+=["","Survival > Capital > Growth","Mark W/L in signals_log.csv"]
+    lines+=["","Survival > Capital > Growth","Outcome auto-tracked from the chart"]
     return "\n".join(lines)
 
 # =====================================================================================
