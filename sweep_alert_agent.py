@@ -90,6 +90,8 @@ COOLDOWN_MIN_PER_SYMBOL=90; MIN_GAP_BETWEEN_ALERTS=30
 ACCOUNT_SIZE=5000.0; RISK_PCT=1.0; MIN_RR=2.0
 STOP_ATR_MULT_MAX=1.5; STOP_ATR_MULT_MIN=0.40; STOP_BUFFER_ATR=0.15
 PACE_SAFETY=0.80
+# Max distance a LIMIT entry may sit from current price (× ATR15) so it stays fillable.
+MAX_ENTRY_PULLBACK_ATR=0.8
 
 # ---- Sweep-specific -----------------------------------------------------------------
 SWEEP_LOOKBACK=4; MAX_SWEEP_OVERSHOOT_ATR=1.5; MAX_EXTENSION_ATR=2.5
@@ -1096,6 +1098,19 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
         if abs(stop-entry)>sl_max*atr15:          # cap: never exceed ATR stop limit
             entry=stop+sgn*sl_max*atr15
         reasons.append(f"entry tightened (ADX {trend_adx:.0f} trend)")
+
+    # ---- Hard reachability cap (always on) ------------------------------------------
+    # Guarantee the limit is fillable in ANY regime: it must never sit more than
+    # MAX_ENTRY_PULLBACK_ATR × ATR away from the current price. This is the core fix
+    # for "correct direction but the entry was never touched" — still a pullback
+    # (we don't chase), but always within normal intraday reach.
+    max_pull=MAX_ENTRY_PULLBACK_ATR*atr15
+    pullback=(close_now-entry) if side=="long" else (entry-close_now)
+    if pullback>max_pull:
+        entry=close_now-sgn*max_pull
+        if abs(stop-entry)>sl_max*atr15:          # keep within the ATR stop limit
+            entry=stop+sgn*sl_max*atr15
+        reasons.append(f"entry capped to {MAX_ENTRY_PULLBACK_ATR:.1f}x ATR of price")
 
     risk=abs(stop-entry)
     if risk<=0 or risk>sl_max*atr15 or risk<sl_min*atr15:
