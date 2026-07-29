@@ -1080,6 +1080,23 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
 
     sl_max=cfg.get("atr_sl_max",STOP_ATR_MULT_MAX)
     sl_min=cfg.get("atr_sl_min",STOP_ATR_MULT_MIN)
+
+    # ---- Momentum-adaptive entry (improve fill rate in trends) ----------------------
+    # A deep limit rarely fills in a strong trend — price just runs (the "correct
+    # direction but never entered" problem). Measure trend strength (ADX); when
+    # strong, pull the entry toward current price so it is actually reachable, capped
+    # so risk never exceeds the per-instrument ATR stop limit. Calm markets keep the
+    # deeper, better-priced entry unchanged.
+    close_now=float(m15c["Close"].iloc[-1])
+    trend_adx=adx(m15c.tail(60),14) if len(m15c)>=60 else 0.0
+    pullback=(close_now-entry) if side=="long" else (entry-close_now)
+    if trend_adx>=20 and pullback>0:
+        shrink=0.45 if trend_adx>=25 else 0.70
+        entry=close_now-sgn*pullback*shrink
+        if abs(stop-entry)>sl_max*atr15:          # cap: never exceed ATR stop limit
+            entry=stop+sgn*sl_max*atr15
+        reasons.append(f"entry tightened (ADX {trend_adx:.0f} trend)")
+
     risk=abs(stop-entry)
     if risk<=0 or risk>sl_max*atr15 or risk<sl_min*atr15:
         return None
