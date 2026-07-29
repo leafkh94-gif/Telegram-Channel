@@ -402,6 +402,22 @@ def strategy_winrates():
         pass
     return stats
 
+def fill_stats():
+    """Return (filled, no_fill) counts across all graded signals.
+    filled = W+L+N (price returned to entry); no_fill = NF (never triggered)."""
+    filled=0; nofill=0
+    if not os.path.exists(SIGNALS_CSV): return (0,0)
+    try:
+        with open(SIGNALS_CSV,"r") as f:
+            for row in csv.DictReader(f):
+                if row.get("alerted") not in ("A+","WATCH"): continue
+                o=row.get("outcome")
+                if o in ("W","L","N"): filled+=1
+                elif o=="NF": nofill+=1
+    except Exception:
+        pass
+    return (filled,nofill)
+
 # =====================================================================================
 # CSV logging (trade-journal 18-field)
 # =====================================================================================
@@ -425,9 +441,11 @@ def log_csv(row):
 # =====================================================================================
 # The bot is alert-only (no live account), so nothing reports back whether a signal
 # won or lost. This closes that loop: a few hours after each alert we replay the
-# 15-minute candles and check what price hit first — the target (TP1 → Win) or the
-# stop (→ Loss). Neither within the window → N (expired). Results feed the daily
-# digest win-rate and per-strategy stats. Purely observational; never trades.
+# 15-minute candles. Because entries are LIMIT pullbacks, we first check whether
+# price ever returned to the entry (a real fill). If it never did → NF (no-fill).
+# If filled, we then check what came first — TP1 (Win) or the stop (Loss); neither
+# within the window → N. Results feed the daily digest win-rate, fill-rate, and
+# per-strategy stats. Purely observational; never trades.
 
 EVAL_HORIZON_HOURS = 4.0   # how long a signal has to reach TP1 before it's graded
 
@@ -439,16 +457,29 @@ def _parse_ts(s):
     except Exception:
         return None
 
-def _first_hit(window, side, stop, tp1):
-    """Scan candles in time order; return 'W', 'L', or 'N'.
-    If a single candle straddles both levels, grade conservatively as a loss."""
+def grade_signal(window, side, entry, stop, tp1):
+    """Replay candles and grade the LIMIT-pullback signal honestly:
+      NF = never filled  (price never returned to the entry — no trade happened)
+      L  = filled, then stop hit first
+      W  = filled, then TP1 hit first
+      N  = filled but neither TP1 nor stop reached within the window
+    A candle that both fills and straddles the levels is graded conservatively (L)."""
+    filled=False
     for _,b in window.iterrows():
         hi=float(b["High"]); lo=float(b["Low"])
+        if not filled:
+            if entry is None:
+                filled=True
+            elif side=="long"  and lo<=entry: filled=True
+            elif side=="short" and hi>=entry: filled=True
+            if not filled:
+                continue
+        # entry is filled — from here look for the exit
         hit_stop = lo<=stop if side=="long" else hi>=stop
         hit_tp   = hi>=tp1  if side=="long" else lo<=tp1
         if hit_stop: return "L"      # stop checked first = conservative
         if hit_tp:   return "W"
-    return "N"
+    return "N" if filled else "NF"
 
 def _rewrite_signals(rows):
     try:
@@ -487,12 +518,12 @@ def evaluate_pending_outcomes(now, use_capital):
         if df is None or len(df)==0: continue
         ts=_parse_ts(r.get("ts_utc"))
         try:
-            stop=float(r["stop"]); tp1=float(r["tp1"]); side=r["side"]
+            entry=float(r["entry"]); stop=float(r["stop"]); tp1=float(r["tp1"]); side=r["side"]
         except (KeyError,ValueError,TypeError):
             continue
         window=df[(df.index>ts)&(df.index<=ts+timedelta(hours=EVAL_HORIZON_HOURS))]
         if len(window)==0: continue
-        r["outcome"]=_first_hit(window,side,stop,tp1); changed=True
+        r["outcome"]=grade_signal(window,side,entry,stop,tp1); changed=True
     if changed:
         graded=sum(1 for r in pending if r.get("outcome"))
         _rewrite_signals(rows)
@@ -1049,6 +1080,23 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
 
     sl_max=cfg.get("atr_sl_max",STOP_ATR_MULT_MAX)
     sl_min=cfg.get("atr_sl_min",STOP_ATR_MULT_MIN)
+
+    # ---- Momentum-adaptive entry (improve fill rate in trends) ----------------------
+    # A deep limit rarely fills in a strong trend — price just runs (the "correct
+    # direction but never entered" problem). Measure trend strength (ADX); when
+    # strong, pull the entry toward current price so it is actually reachable, capped
+    # so risk never exceeds the per-instrument ATR stop limit. Calm markets keep the
+    # deeper, better-priced entry unchanged.
+    close_now=float(m15c["Close"].iloc[-1])
+    trend_adx=adx(m15c.tail(60),14) if len(m15c)>=60 else 0.0
+    pullback=(close_now-entry) if side=="long" else (entry-close_now)
+    if trend_adx>=20 and pullback>0:
+        shrink=0.45 if trend_adx>=25 else 0.70
+        entry=close_now-sgn*pullback*shrink
+        if abs(stop-entry)>sl_max*atr15:          # cap: never exceed ATR stop limit
+            entry=stop+sgn*sl_max*atr15
+        reasons.append(f"entry tightened (ADX {trend_adx:.0f} trend)")
+
     risk=abs(stop-entry)
     if risk<=0 or risk>sl_max*atr15 or risk<sl_min*atr15:
         return None
@@ -1120,11 +1168,15 @@ def alert_text(c,cfg,tier,now,st):
     arrow="SHORT" if c["side"]=="short" else "LONG"
     head="A+ SETUP" if tier=="A+" else "WATCH (heads-up only)"
     hold_to=min(now+timedelta(hours=MAX_HOLD_HOURS),c["flat_by"])
+    # Optional "aggressive" entry, halfway to price — for momentum days when price
+    # won't pull all the way back to the limit. Same stop, so smaller reward:risk.
+    agg=c["entry"]+(0.5*c["atr15"] if c["side"]=="long" else -0.5*c["atr15"])
     lines=[
         f"[{head}] {arrow} {c['symbol']} ({cfg['cfd']}) — score {c['score']:.0f}/100",
         STRAT_LABELS.get(c["strategy"],c["strategy"]),
         "",
         f"Entry  {c['entry']:.2f}  (LIMIT pullback — never chase)",
+        f"  alt aggressive entry {agg:.2f} (optional, if no pullback — smaller R:R)",
         f"Stop   {c['stop']:.2f}  ({c['risk_pts']:.2f}pts = {c['risk_pts']/c['atr15']:.1f}x ATR15)",
         "",
         "EXIT PLAN:",
@@ -1219,6 +1271,9 @@ def run_cycle(loop_mode):
                 parts=[f"{s.split(':')[0] if ':' in s else s}: {w}/{tt} ({w/tt*100:.0f}%)"
                        for s,(w,tt) in sorted(sw.items(),key=lambda x:-x[1][1])]
                 ws+="\nBy strategy: "+" | ".join(parts)
+        filled,nofill=fill_stats()
+        if filled+nofill>0:
+            ws+=f"\nFills: {filled} filled / {nofill} no-fill ({filled/(filled+nofill)*100:.0f}% fill rate)"
         tg_send(f"Daily digest v3.0\nA+: {st.get('aplus_sent',0)} | WATCH: {st.get('watch_sent',0)} | "
                 f"evaluated: {st.get('evaluated',0)}\n{bt}\n"
                 f"Threshold: {st.get('threshold',SCORE_A_PLUS):.0f}"
