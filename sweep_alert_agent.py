@@ -404,6 +404,28 @@ def strategy_winrates():
         pass
     return stats
 
+def friendly_strategy(strat):
+    """Turn a raw strategy key like 'liquidity-sweep' into 'Liquidity Sweep'."""
+    if not strat: return "?"
+    if ":" in strat: strat=strat.split(":",1)[1].strip()   # strip "Strategy N:" prefix
+    return strat.replace("-"," ").replace("_"," ").title()
+
+def outcome_breakdown(n=30):
+    """Return counts of the most recent n graded alerts, broken down plainly:
+    W=took profit, L=hit stop, NF=never reached entry, N=filled but still open."""
+    seq=[]
+    if not os.path.exists(SIGNALS_CSV): return {}
+    try:
+        with open(SIGNALS_CSV,"r") as f:
+            for row in csv.DictReader(f):
+                if row.get("alerted") in ("A+","WATCH") and row.get("outcome") in ("W","L","N","NF"):
+                    seq.append(row["outcome"])
+    except Exception:
+        pass
+    seq=seq[-n:]
+    return {"W":seq.count("W"),"L":seq.count("L"),"N":seq.count("N"),
+            "NF":seq.count("NF"),"total":len(seq)}
+
 def fill_stats():
     """Return (filled, no_fill) counts across all graded signals.
     filled = W+L+N (price returned to entry); no_fill = NF (never triggered)."""
@@ -1276,23 +1298,47 @@ def run_cycle(loop_mode):
     digest_cutoff=hhmm_today(now,"21:00")
     if digest_time<=now<digest_cutoff and not st.get("digest_sent"):
         best=st.get("best_today")
-        bt=f"best: {best['symbol']} {best['strategy']} {best['side']} scored {best['score']:.0f}" if best else "no qualifying setup"
-        ws=""
-        if outcomes:
-            r=outcomes[-20:]; wins=r.count("W"); t=len(r)
-            ws=f"\nRecent ({t}): WR {wins/t*100:.0f}% | streak: {count_consec_losses(outcomes)} L"
-            sw=strategy_winrates()
-            if sw:
-                parts=[f"{s.split(':')[0] if ':' in s else s}: {w}/{tt} ({w/tt*100:.0f}%)"
-                       for s,(w,tt) in sorted(sw.items(),key=lambda x:-x[1][1])]
-                ws+="\nBy strategy: "+" | ".join(parts)
+        L=[]
+        L.append("📊 DAILY SUMMARY")
+        L.append("")
+        L.append(f"Today the bot sent {st.get('aplus_sent',0)} strong (A+) and "
+                 f"{st.get('watch_sent',0)} watch alerts.")
+        L.append(f"It checked {st.get('evaluated',0)} possible setups.")
+        if best:
+            L.append(f"Best setup seen: {best['symbol']} {best['side'].upper()} "
+                     f"({friendly_strategy(best['strategy'])}), score {best['score']:.0f}/100.")
+
+        bd=outcome_breakdown(30)
+        if bd.get("total"):
+            L.append("")
+            L.append(f"── What happened to the last {bd['total']} alerts ──")
+            L.append(f"✅ Took profit (hit target): {bd['W']}")
+            L.append(f"❌ Hit the stop (loss): {bd['L']}")
+            L.append(f"↩️ Price never reached entry: {bd['NF']}")
+            if bd['N']:
+                L.append(f"⏳ Entered, still no result yet: {bd['N']}")
+            decided=bd['W']+bd['L']
+            if decided:
+                L.append(f"➡️ Of the {decided} that actually traded, "
+                         f"{bd['W']/decided*100:.0f}% won.")
+
+        sw=strategy_winrates()
+        if sw:
+            L.append("")
+            L.append("Win rate by strategy (all-time):")
+            for s,(w,tt) in sorted(sw.items(),key=lambda x:-x[1][1]):
+                L.append(f"• {friendly_strategy(s)}: {w} of {tt} won ({w/tt*100:.0f}%)")
+
         filled,nofill=fill_stats()
         if filled+nofill>0:
-            ws+=f"\nFills: {filled} filled / {nofill} no-fill ({filled/(filled+nofill)*100:.0f}% fill rate)"
-        tg_send(f"Daily digest v3.0\nA+: {st.get('aplus_sent',0)} | WATCH: {st.get('watch_sent',0)} | "
-                f"evaluated: {st.get('evaluated',0)}\n{bt}\n"
-                f"Threshold: {st.get('threshold',SCORE_A_PLUS):.0f}"
-                f"{ws}\nA no-trade day is a winning day.")
+            L.append("")
+            L.append(f"Entry fill rate (all-time): {filled/(filled+nofill)*100:.0f}% "
+                     f"— {filled} entries reached, {nofill} missed.")
+
+        L.append("")
+        L.append(f"Current alert threshold: {st.get('threshold',SCORE_A_PLUS):.0f}/100.")
+        L.append("A no-trade day is a winning day. 🌱")
+        tg_send("\n".join(L))
         st["digest_sent"]=True; save_state(st); return
 
     if in_blackout(now):
