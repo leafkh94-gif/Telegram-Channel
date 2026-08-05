@@ -442,6 +442,36 @@ def fill_stats():
         pass
     return (filled,nofill)
 
+OUTCOME_LABEL = {
+    "W":  "✅ Took profit",
+    "L":  "❌ Hit the stop (loss)",
+    "N":  "⏳ Entered, still no result yet",
+    "NF": "↩️ Price never reached entry",
+}
+
+def todays_signal_details(now):
+    """List every A+/WATCH alert sent today with its plain-language outcome.
+    Entirely automatic — grade_signal() replays real market candles; nothing here
+    requires a person to place or report a trade."""
+    out=[]
+    if not os.path.exists(SIGNALS_CSV): return out
+    today=now.date()
+    try:
+        with open(SIGNALS_CSV,"r") as f:
+            for row in csv.DictReader(f):
+                if row.get("alerted") not in ("A+","WATCH"): continue
+                ts=_parse_ts(row.get("ts_utc"))
+                if not ts or ts.date()!=today: continue
+                out.append({
+                    "symbol":   row.get("symbol","?"),
+                    "strategy": friendly_strategy(row.get("strategy","?")),
+                    "side":     row.get("side","?").upper(),
+                    "label":    OUTCOME_LABEL.get(row.get("outcome"), "🕐 Too early to grade yet"),
+                })
+    except Exception:
+        pass
+    return out
+
 # =====================================================================================
 # CSV logging (trade-journal 18-field)
 # =====================================================================================
@@ -1307,6 +1337,13 @@ def run_cycle(loop_mode):
         if best:
             L.append(f"Best setup seen: {best['symbol']} {best['side'].upper()} "
                      f"({friendly_strategy(best['strategy'])}), score {best['score']:.0f}/100.")
+
+        today_signals=todays_signal_details(now)
+        if today_signals:
+            L.append("")
+            L.append("── Today's setups, one by one (graded automatically — no trading needed) ──")
+            for s in today_signals:
+                L.append(f"• {s['symbol']} {s['side']} {s['strategy']} → {s['label']}")
 
         bd=outcome_breakdown(30)
         if bd.get("total"):
