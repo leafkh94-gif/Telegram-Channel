@@ -41,13 +41,13 @@ import requests, pandas as pd
 
 SYMBOLS = {
     "GOLD":   {"yf":"GC=F",  "kind":"gold",  "cfd":"XAUUSD","per_lot_per_pt":100.0,"round_step":50.0,
-               "session_bonus":{"london":8,"ny":8},  "atr_sl_max":1.5,"atr_sl_min":0.40},
+               "session_bonus":{"london":8,"ny":8},  "atr_sl_max":1.5,"atr_sl_min":0.55},
     "SP500":  {"yf":"ES=F",  "kind":"index", "cfd":"US500", "per_lot_per_pt":1.0,  "round_step":100.0,
-               "session_bonus":{"london":4,"ny":10}, "atr_sl_max":1.8,"atr_sl_min":0.50},
+               "session_bonus":{"london":4,"ny":10}, "atr_sl_max":1.8,"atr_sl_min":0.65},
     "NASDAQ": {"yf":"NQ=F",  "kind":"index", "cfd":"US100", "per_lot_per_pt":1.0,  "round_step":250.0,
-               "session_bonus":{"london":3,"ny":10}, "atr_sl_max":2.0,"atr_sl_min":0.55},
+               "session_bonus":{"london":3,"ny":10}, "atr_sl_max":2.0,"atr_sl_min":0.70},
     "DOW":    {"yf":"YM=F",  "kind":"index", "cfd":"US30",  "per_lot_per_pt":1.0,  "round_step":500.0,
-               "session_bonus":{"london":4,"ny":10}, "atr_sl_max":1.8,"atr_sl_min":0.50},
+               "session_bonus":{"london":4,"ny":10}, "atr_sl_max":1.8,"atr_sl_min":0.65},
 }
 ENABLE_SHORTS = True
 ENABLE_LONGS  = True
@@ -88,7 +88,10 @@ COOLDOWN_MIN_PER_SYMBOL=90; MIN_GAP_BETWEEN_ALERTS=30
 
 # ---- Risk (playbook S3 + risk-management skill) ------------------------------------
 ACCOUNT_SIZE=5000.0; RISK_PCT=1.0; MIN_RR=2.0
-STOP_ATR_MULT_MAX=1.5; STOP_ATR_MULT_MIN=0.40; STOP_BUFFER_ATR=0.15
+# STOP_BUFFER_ATR/STOP_ATR_MULT_MIN widened (0.15->0.35, 0.40->0.55) — stops sitting
+# right on the structural level were getting clipped by ordinary retest wicks before
+# the reversal confirmed, well below the ~33% breakeven win rate needed at 2:1 R:R.
+STOP_ATR_MULT_MAX=1.5; STOP_ATR_MULT_MIN=0.55; STOP_BUFFER_ATR=0.35
 PACE_SAFETY=0.80
 # Max distance a LIMIT entry may sit from current price (× ATR15) so it stays fillable.
 MAX_ENTRY_PULLBACK_ATR=0.8
