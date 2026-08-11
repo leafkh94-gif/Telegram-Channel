@@ -200,15 +200,16 @@ def _cap_fetch(epic, resolution, count):
         def mid(s): b=s.get("bid") or 0; a=s.get("ask") or 0; return (float(b)+float(a))/2 if b and a else float(b or a or 0)
         try:
             ts = pd.Timestamp(p["snapshotTime"], tz="UTC")
-            rows.append({"Open": mid(p["openPrice"]), "High": mid(p["highPrice"]),
+            rows.append({"ts": ts,
+                         "Open": mid(p["openPrice"]), "High": mid(p["highPrice"]),
                          "Low": mid(p["lowPrice"]),  "Close": mid(p["closePrice"])})
         except: pass
     if not rows: return None
-    df = pd.DataFrame(rows)
-    # build a DatetimeIndex (Capital doesn't return timestamps in order sometimes)
-    freq = {"15m": "15min", "1h": "h", "1d": "D"}[resolution]
-    end = pd.Timestamp.now("UTC").floor(freq)
-    df.index = pd.date_range(end=end, periods=len(df), freq=freq, tz="UTC")
+    # Use the REAL candle time as the index and sort chronologically. Capital.com
+    # does not reliably return prices oldest-first, so we must never assume order:
+    # fabricating an ordered index silently reverses the series in time.
+    df = pd.DataFrame(rows).set_index("ts").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
     return df
 
 # =====================================================================================
@@ -1404,9 +1405,9 @@ def run_cycle(loop_mode):
                 h1  = _cap_fetch(epic, "1h",  300)
                 d1  = _cap_fetch(epic, "1d",  300)
             else:
-                m15 = fetch(cfg["yf"], "15m", "5d")
+                m15 = fetch(cfg["yf"], "15m", "10d")
                 h1  = fetch(cfg["yf"], "1h",  "1mo")
-                d1  = fetch(cfg["yf"], "1d",  "6mo")
+                d1  = fetch(cfg["yf"], "1d",  "2y")
         except Exception as e:
             log(f"{name}: data fetch error: {e}"); continue
         if m15 is None or h1 is None or d1 is None: continue
