@@ -78,15 +78,15 @@ MAX_HOLD_HOURS=4.0; SCAN_EVERY_MIN=15
 #   • Daily A+ cap reached (4 alerts/day)    → threshold rises by 1 pt next day (ceil: 85)
 #     "Market is noisy — be more selective"
 #
-#   • 3 consecutive losses                   → threshold rises by 5 pts (ceil: 85)
-#     "Protect capital — require higher quality after a loss streak"
+# (A loss-streak rule — 3 consecutive losses → +5 pts — existed once but was
+#  deliberately removed with the other loss-based circuit breakers in #33:
+#  this is an alert-only bot with no positions to protect.)
 #
 # Goal: at least one quality alert per day — no total silence, no noise flood.
 #
 # العتبة التكيفية (بالعربي):
 #  • 3 أيام بلا إشارات A+ → تنزل العتبة 2 نقطة (حد أدنى 65)
 #  • وصول الحد الأقصى (4 إشارات/يوم) → ترتفع نقطة واحدة (حد أقصى 85)
-#  • 3 خسائر متتالية → ترتفع 5 نقاط إضافية
 # الهدف: تنبيهات بجودة معقولة كل يوم — لا صمت تام ولا فوضى.
 SCORE_A_PLUS=75; SCORE_A_PLUS_FLOOR=65; SCORE_A_PLUS_CEIL=85
 ADAPTIVE_THRESHOLD=True; SILENT_DAYS_TO_ADAPT=3
@@ -210,7 +210,11 @@ def _cap_fetch(epic, resolution, count):
     for p in data.get("prices", []):
         def mid(s): b=s.get("bid") or 0; a=s.get("ask") or 0; return (float(b)+float(a))/2 if b and a else float(b or a or 0)
         try:
-            ts = pd.Timestamp(p["snapshotTime"], tz="UTC")
+            # Capital.com returns snapshotTime in the SERVER's timezone; the UTC
+            # value is the separate snapshotTimeUTC field. Parsing snapshotTime as
+            # UTC shifts every candle by the server offset, which breaks the
+            # closed-bar freshness gate and grades alerts against pre-alert candles.
+            ts = pd.Timestamp(p.get("snapshotTimeUTC") or p["snapshotTime"], tz="UTC")
             rows.append({"ts": ts,
                          "Open": mid(p["openPrice"]), "High": mid(p["highPrice"]),
                          "Low": mid(p["lowPrice"]),  "Close": mid(p["closePrice"])})
@@ -386,24 +390,6 @@ def save_state(st):
         with open(STATE_FILE,"w") as f: json.dump(st,f,indent=2)
     except OSError: pass
 
-def read_outcomes():
-    if not os.path.exists(SIGNALS_CSV): return []
-    out=[]
-    try:
-        with open(SIGNALS_CSV,"r") as f:
-            for row in csv.DictReader(f):
-                if row.get("alerted") in ("A+","WATCH") and row.get("outcome") in ("W","L"):
-                    out.append(row["outcome"])
-    except: pass
-    return out
-
-def count_consec_losses(outcomes):
-    c=0
-    for o in reversed(outcomes):
-        if o=="L": c+=1
-        else: break
-    return c
-
 def strategy_winrates():
     """Return {strategy: (wins, total)} from all graded W/L signals."""
     stats={}
@@ -458,16 +444,19 @@ def fill_stats():
     return (filled,nofill)
 
 def strategy_realized_r_stats():
-    """Return {strategy: (n, mean_r, sum_r)} over rows with a numeric realized_r.
-    None/blank realized_r (still-open trades) are excluded, so the stats reflect
-    closed positions only. Old CSV rows written before FIX 1 have no realized_r
-    column and are silently skipped."""
+    """Return {strategy: (n, mean_r, sum_r)} over CLOSED TRADES with a numeric
+    realized_r. Excluded: still-open trades (blank realized_r), never-filled
+    signals (outcome NF — the CSV stores their realized_r as 0.0 per the exit
+    model, but no trade happened, so counting them would dilute the per-trade
+    expectancy toward zero and disagree with the win-rate counts shown on the
+    same digest line), and pre-FIX-1 rows that have no realized_r column."""
     buckets={}
     if not os.path.exists(SIGNALS_CSV): return {}
     try:
         with open(SIGNALS_CSV,"r") as f:
             for row in csv.DictReader(f):
                 if row.get("alerted") not in ("A+","WATCH"): continue
+                if row.get("outcome")=="NF": continue
                 rv=row.get("realized_r","")
                 if rv in ("", None): continue
                 try: v=float(rv)
@@ -520,9 +509,37 @@ CSV_FIELDS=["ts_utc","symbol","cfd","side","strategy","score","setup_quality",
     # deterministically later, without needing 14+ bars in the eval window.
     "atr15","mfe_r","mae_r","exit_tier","realized_r"]
 
+def _migrate_csv_schema():
+    """One-time migration when the on-disk header is older than CSV_FIELDS.
+    The Actions workflow restores signals_log.csv from cache, so after a deploy
+    that adds columns the file still carries the old header; appending new-schema
+    rows under it misaligns every added column (atr15 etc. land in DictReader's
+    restkey and are destroyed on the next rewrite). Rewrite under the new header,
+    recovering any already-misaligned appended values from the restkey."""
+    try:
+        with open(SIGNALS_CSV,"r",newline="") as f:
+            header=next(csv.reader(f),None)
+        if header is None or header==CSV_FIELDS:
+            return
+        with open(SIGNALS_CSV,"r",newline="") as f:
+            rows=list(csv.DictReader(f))
+        # Columns are only ever appended, so the old header is a prefix of
+        # CSV_FIELDS and restkey extras map onto the new tail in order.
+        tail=CSV_FIELDS[len(header):]
+        for r in rows:
+            extra=r.pop(None,None)
+            if extra:
+                for fld,val in zip(tail,extra):
+                    r.setdefault(fld,val)
+        _rewrite_signals(rows)
+        log(f"signals_log.csv migrated: {len(header)} -> {len(CSV_FIELDS)} columns.")
+    except Exception:
+        pass
+
 def log_csv(row):
     new=not os.path.exists(SIGNALS_CSV)
     try:
+        if not new: _migrate_csv_schema()
         with open(SIGNALS_CSV,"a",newline="") as f:
             w=csv.DictWriter(f,fieldnames=CSV_FIELDS,extrasaction="ignore")
             if new: w.writeheader()
@@ -645,6 +662,7 @@ def evaluate_pending_outcomes(now, use_capital):
     """Grade any alerted signals older than EVAL_HORIZON_HOURS that have no outcome yet."""
     if not use_capital or not os.path.exists(SIGNALS_CSV):
         return
+    _migrate_csv_schema()   # this path rewrites the CSV — never do that on a stale header
     try:
         with open(SIGNALS_CSV,"r") as f: rows=list(csv.DictReader(f))
     except Exception:
@@ -1436,7 +1454,6 @@ def run_cycle(loop_mode):
         if loop_mode: log(f"Market closed ({now.strftime('%A %H:%M')} UTC).")
         return
     st=load_state()
-    outcomes=read_outcomes()
     # Hard flat = 15 min before daily close (21:00 UTC)
     hard_flat=hhmm_today(now,HARD_FLAT_UTC)
 
