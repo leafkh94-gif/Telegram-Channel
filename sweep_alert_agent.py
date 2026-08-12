@@ -5,6 +5,12 @@ sweep_alert_agent.py  v3.0 — Multi-Strategy Edition
 ====================================================
 5-strategy intraday alert agent for Gold (XAUUSD) and US index CFDs.
 
+THE LIVE ALERT BOT IS THIS ONE FILE. The strategy/, agents/, execution/
+folders and main.py / main_live.py are dead code — nothing this bot runs at
+runtime imports them. Edit those and you're editing paper: the live agent
+will not see it. All changes to signal generation, scoring, exit modeling,
+CSV logging, and digest formatting belong in this file.
+
 STRATEGIES (from "The Short Trader's Playbook" + Smart Trading Framework):
   1. Supply Zone / Order Block Rejection
   2. Liquidity Sweep + Break of Structure (ICT/SMC)
@@ -34,6 +40,7 @@ Deps: pip install pandas requests
 import os, sys, csv, json, time, math, random, traceback, threading, base64
 from datetime import datetime, timedelta, timezone
 import requests, pandas as pd
+import yfinance as yf   # used by the Yahoo fallback + --test path (fetch())
 
 # =====================================================================================
 # CONFIG
@@ -103,7 +110,11 @@ SWEEP_LOOKBACK=4; MAX_SWEEP_OVERSHOOT_ATR=1.5; MAX_EXTENSION_ATR=2.5
 TP1_RR=2.0; TP2_RR=3.0; TRAIL_ATR_MULT=2.5; TIME_STOP_HOURS=3.0
 
 # ---- Stop randomization (exit-strategies) -------------------------------------------
-STOP_RANDOMIZE=True; STOP_RAND_MIN=0.05; STOP_RAND_MAX=0.15
+# Disabled while collecting the realized-R baseline (FIX 2): the 0.05-0.15*ATR
+# random offset makes the same setup grade to a different realized_r each run,
+# polluting the per-strategy expectancy measurement. Re-enable after the ~60-signal
+# baseline is in.
+STOP_RANDOMIZE=False; STOP_RAND_MIN=0.05; STOP_RAND_MAX=0.15
 
 # ---- News blackout ------------------------------------------------------------------
 RECURRING_BLACKOUTS_UTC=[("12:25","13:05"),("13:25","14:05")]
@@ -446,6 +457,26 @@ def fill_stats():
         pass
     return (filled,nofill)
 
+def strategy_realized_r_stats():
+    """Return {strategy: (n, mean_r, sum_r)} over rows with a numeric realized_r.
+    None/blank realized_r (still-open trades) are excluded, so the stats reflect
+    closed positions only. Old CSV rows written before FIX 1 have no realized_r
+    column and are silently skipped."""
+    buckets={}
+    if not os.path.exists(SIGNALS_CSV): return {}
+    try:
+        with open(SIGNALS_CSV,"r") as f:
+            for row in csv.DictReader(f):
+                if row.get("alerted") not in ("A+","WATCH"): continue
+                rv=row.get("realized_r","")
+                if rv in ("", None): continue
+                try: v=float(rv)
+                except (ValueError,TypeError): continue
+                buckets.setdefault(row.get("strategy","?"), []).append(v)
+    except Exception:
+        pass
+    return {s:(len(vs), sum(vs)/len(vs), sum(vs)) for s,vs in buckets.items() if vs}
+
 OUTCOME_LABEL = {
     "W":  "✅ Took profit",
     "L":  "❌ Hit the stop (loss)",
@@ -483,7 +514,11 @@ def todays_signal_details(now):
 CSV_FIELDS=["ts_utc","symbol","cfd","side","strategy","score","setup_quality",
     "entry","stop","tp1","tp2","trailing_method","time_stop",
     "risk_pts","level","level_price","reasons","alerted",
-    "outcome","exit_price","pnl_usd","hold_minutes","lessons"]
+    "outcome","exit_price","pnl_usd","hold_minutes","lessons",
+    # FIX 1: magnitude columns added alongside the W/L/N/NF outcome. atr15 is
+    # captured at signal time so grade_signal() can model the Chandelier trail
+    # deterministically later, without needing 14+ bars in the eval window.
+    "atr15","mfe_r","mae_r","exit_tier","realized_r"]
 
 def log_csv(row):
     new=not os.path.exists(SIGNALS_CSV)
@@ -515,15 +550,34 @@ def _parse_ts(s):
     except Exception:
         return None
 
-def grade_signal(window, side, entry, stop, tp1):
-    """Replay candles and grade the LIMIT-pullback signal honestly:
-      NF = never filled  (price never returned to the entry — no trade happened)
-      L  = filled, then stop hit first
-      W  = filled, then TP1 hit first
-      N  = filled but neither TP1 nor stop reached within the window
-    A candle that both fills and straddles the levels is graded conservatively (L)."""
+def grade_signal(window, side, entry, stop, tp1, atr_window=None):
+    """Replay candles and grade the LIMIT-pullback signal. Returns a dict:
+      outcome:    "W" / "L" / "N" / "NF"  (unchanged classification — same
+                  fill-first-then-stop-vs-tp1 check as before, same conservative
+                  L on a single bar that straddles both levels)
+      mfe_r:      max favorable excursion from entry, in R
+      mae_r:      max adverse   excursion from entry, in R (<= 0)
+      exit_tier:  "STOP" / "TP1_BE" / "TP1_TRAIL" / "OPEN" / "NONE"
+      realized_r: modeled realized R over the 2-tier exit:
+                    -1.0            on STOP
+                    1.0 + 0.5*R_run on TP1 hit (banks 1R, runner is 50%)
+                    0.0             on NONE (never filled — no trade)
+                    None            on OPEN (still running past the eval window)
+
+    2-tier exit model (mirrors the alert's stated plan): after TP1 fills 50% at
+    +2R, 1R is banked and the remaining 50% trails with a Chandelier at
+    TRAIL_ATR_MULT*atr_window from the running high/low since TP1, floored at
+    BE (never worse than entry). If atr_window is unknown (old CSV rows), the
+    runner is assumed to exit at BE — a deliberately conservative fallback."""
+    risk = abs(entry-stop) if (entry is not None and stop is not None) else 0.0
+    sgn  = 1 if side=="long" else -1
+    def r_of(p):
+        return (sgn*(p-entry)/risk) if risk>0 else 0.0
+
     filled=False
-    for _,b in window.iterrows():
+    mfe_r=0.0; mae_r=0.0
+    tp1_hit_idx=None
+    for i,(_,b) in enumerate(window.iterrows()):
         hi=float(b["High"]); lo=float(b["Low"])
         if not filled:
             if entry is None:
@@ -532,12 +586,52 @@ def grade_signal(window, side, entry, stop, tp1):
             elif side=="short" and hi>=entry: filled=True
             if not filled:
                 continue
-        # entry is filled — from here look for the exit
+        # entry is filled — track MFE/MAE, then check exits
+        mfe_r=max(mfe_r, r_of(hi if side=="long" else lo))
+        mae_r=min(mae_r, r_of(lo if side=="long" else hi))
         hit_stop = lo<=stop if side=="long" else hi>=stop
         hit_tp   = hi>=tp1  if side=="long" else lo<=tp1
-        if hit_stop: return "L"      # stop checked first = conservative
-        if hit_tp:   return "W"
-    return "N" if filled else "NF"
+        if hit_stop:
+            return {"outcome":"L","mfe_r":round(mfe_r,3),"mae_r":round(mae_r,3),
+                    "exit_tier":"STOP","realized_r":-1.0}
+        if hit_tp:
+            tp1_hit_idx=i
+            break
+    if not filled:
+        return {"outcome":"NF","mfe_r":0.0,"mae_r":0.0,
+                "exit_tier":"NONE","realized_r":0.0}
+    if tp1_hit_idx is None:
+        return {"outcome":"N","mfe_r":round(mfe_r,3),"mae_r":round(mae_r,3),
+                "exit_tier":"OPEN","realized_r":None}
+
+    # TP1 hit — model the runner. Chandelier from the peak since TP1, floored at BE.
+    runner_exit=entry
+    if atr_window and atr_window>0:
+        tp1_bar=window.iloc[tp1_hit_idx]
+        peak=float(tp1_bar["High"] if side=="long" else tp1_bar["Low"])
+        tail=window.iloc[tp1_hit_idx+1:]
+        exited=False
+        for _,b in tail.iterrows():
+            hi=float(b["High"]); lo=float(b["Low"])
+            mfe_r=max(mfe_r, r_of(hi if side=="long" else lo))
+            mae_r=min(mae_r, r_of(lo if side=="long" else hi))
+            if side=="long":
+                peak=max(peak, hi)
+                runner_stop=max(entry, peak - TRAIL_ATR_MULT*atr_window)
+                if lo<=runner_stop:
+                    runner_exit=runner_stop; exited=True; break
+            else:
+                peak=min(peak, lo)
+                runner_stop=min(entry, peak + TRAIL_ATR_MULT*atr_window)
+                if hi>=runner_stop:
+                    runner_exit=runner_stop; exited=True; break
+        if not exited and len(tail)>0:
+            runner_exit=float(window.iloc[-1]["Close"])
+    r_runner=r_of(runner_exit)
+    realized_r=1.0 + 0.5*r_runner
+    exit_tier="TP1_TRAIL" if r_runner>0.05 else "TP1_BE"
+    return {"outcome":"W","mfe_r":round(mfe_r,3),"mae_r":round(mae_r,3),
+            "exit_tier":exit_tier,"realized_r":round(realized_r,3)}
 
 def _rewrite_signals(rows):
     try:
@@ -579,9 +673,22 @@ def evaluate_pending_outcomes(now, use_capital):
             entry=float(r["entry"]); stop=float(r["stop"]); tp1=float(r["tp1"]); side=r["side"]
         except (KeyError,ValueError,TypeError):
             continue
+        # atr15 is optional — old CSV rows won't have it. When absent, grade_signal
+        # falls back to the conservative "runner exits at BE" model.
+        try:
+            atrw=float(r.get("atr15") or "")
+            if not atrw>0: atrw=None
+        except (ValueError,TypeError):
+            atrw=None
         window=df[(df.index>ts)&(df.index<=ts+timedelta(hours=EVAL_HORIZON_HOURS))]
         if len(window)==0: continue
-        r["outcome"]=grade_signal(window,side,entry,stop,tp1); changed=True
+        res=grade_signal(window,side,entry,stop,tp1,atr_window=atrw)
+        r["outcome"]   = res["outcome"]
+        r["mfe_r"]     = res["mfe_r"]
+        r["mae_r"]     = res["mae_r"]
+        r["exit_tier"] = res["exit_tier"]
+        r["realized_r"]= "" if res["realized_r"] is None else res["realized_r"]
+        changed=True
     if changed:
         graded=sum(1 for r in pending if r.get("outcome"))
         _rewrite_signals(rows)
@@ -866,6 +973,10 @@ def detect_sweep(name,cfg,m15c,atr15,side,levels_same):
         "entry":entry,"stop":extreme,"extreme":extreme,
         "level_name":lname,"level_price":L,"level_weight":lweight,
         "base_score":38,"pattern_bonus":min(10,pb),
+        # FIX 3: expose whether a candle-close BOS actually printed. Detection is
+        # still generous (displacement OR bos), but the tier assignment in
+        # run_cycle caps sweeps without a real BOS at WATCH — heads-up only.
+        "bos_confirmed": bool(bos),
         "reasons":[f"swept {lname} {L:.2f}",
                    "displacement+BOS" if (displacement and bos) else ("displacement" if displacement else "BOS")]
     }]
@@ -1205,6 +1316,8 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
         "level_name":raw["level_name"],"level_price":raw["level_price"],"atr15":atr15,
         "reasons":reasons,"flat_by":flat_by,
         "key":f"{symbol_name}:{side}:{raw['strategy']}:{round(raw['level_price'],1)}",
+        # Non-sweep strategies always pass the BOS gate; sweep sets it explicitly.
+        "bos_confirmed": raw.get("bos_confirmed", True),
     }
 
 # =====================================================================================
@@ -1364,11 +1477,17 @@ def run_cycle(loop_mode):
                          f"{bd['W']/decided*100:.0f}% won.")
 
         sw=strategy_winrates()
+        rr=strategy_realized_r_stats()
         if sw:
             L.append("")
-            L.append("Win rate by strategy (all-time):")
+            L.append("By strategy (win rate + realized R, all-time):")
             for s,(w,tt) in sorted(sw.items(),key=lambda x:-x[1][1]):
-                L.append(f"• {friendly_strategy(s)}: {w} of {tt} won ({w/tt*100:.0f}%)")
+                name=friendly_strategy(s)
+                line=f"• {name}: {w} of {tt} won ({w/tt*100:.0f}%)"
+                if s in rr:
+                    n,mean_r,tot_r=rr[s]
+                    line+=f"  |  realized R: n={n}, mean {mean_r:+.2f}R, total {tot_r:+.2f}R"
+                L.append(line)
 
         filled,nofill=fill_stats()
         if filled+nofill>0:
@@ -1500,6 +1619,15 @@ def run_cycle(loop_mode):
         elif SCORE_WATCH<=c["score"] and st.get("watch_sent",0)<MAX_WATCH_PER_DAY: tier="WATCH"
         if tier is None: continue
 
+        # FIX 3: liquidity-sweep without a candle-close BOS is heads-up only —
+        # cap at WATCH instead of dropping the alert so it still gets logged.
+        if tier=="A+" and c["strategy"]=="liquidity-sweep" and not c.get("bos_confirmed", True):
+            if st.get("watch_sent",0)<MAX_WATCH_PER_DAY:
+                tier="WATCH"
+                c["reasons"].append("BOS not confirmed → WATCH (needs candle-close BOS for A+)")
+            else:
+                continue
+
         if tg_send(alert_text(c,cfg,tier,now,st)):
             log(f"ALERT {tier} {c['symbol']} {c['strategy']} {c['side']} score {c['score']}")
             c["alerted"]=tier
@@ -1522,7 +1650,9 @@ def run_cycle(loop_mode):
                 "risk_pts":round(c["risk_pts"],2),"level":c["level_name"],
                 "level_price":round(c["level_price"],2),
                 "reasons":" | ".join(c["reasons"]),"alerted":c.get("alerted",""),
-                "outcome":"","exit_price":"","pnl_usd":"","hold_minutes":"","lessons":""})
+                "outcome":"","exit_price":"","pnl_usd":"","hold_minutes":"","lessons":"",
+                "atr15":round(c["atr15"],4),
+                "mfe_r":"","mae_r":"","exit_tier":"","realized_r":""})
     push_status_json(st, last_scores, now)
     save_state(st)
 
