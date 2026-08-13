@@ -109,6 +109,23 @@ SWEEP_LOOKBACK=4; MAX_SWEEP_OVERSHOOT_ATR=1.5; MAX_EXTENSION_ATR=2.5
 # ---- Scaled exits (exit-strategies) -------------------------------------------------
 TP1_RR=2.0; TP2_RR=3.0; TRAIL_ATR_MULT=2.5; TIME_STOP_HOURS=3.0
 
+# ---- FIX 4 / FIX 5 demo flags (default OFF = observe-only) ---------------------------
+# Both fixes are "demo-test first": while OFF, they change NOTHING about live alerts,
+# tiers, or grading — they only compute alternative values that get logged to the CSV
+# (tp2_pattern / tp2_pattern_r for FIX 4, score_v2 / gate_v2_pass for FIX 5) so the new
+# behaviour can be compared against the realized-R baseline before it drives anything.
+# Flip a flag to True to let that fix drive live alerts, then re-tune the A+ threshold.
+#
+# FIX 4 — measured-move / opposing-liquidity TP2 for reversal + zone strategies:
+#   double-top/bottom & (inv-)head-shoulders -> neckline projected by pattern height;
+#   zone-rejection -> nearest opposing liquidity. Drives the TP2 shown in the alert
+#   only; TP1 (=2R) and the realized-R grading model are left untouched.
+PATTERN_TARGETS_ENABLED=False
+# FIX 5 — reduce trend double-counting: HTF-aligned bonus +15 -> +10, and the RSI/MACD/
+#   EMA indicator confirmation stops adding points and becomes a >=2/3 aligned GATE
+#   (gate-fail caps the tier at WATCH, mirroring the FIX 3 BOS gate — never dropped).
+SCORE_MODEL_V2=False
+
 # ---- Stop randomization (exit-strategies) -------------------------------------------
 # Disabled while collecting the realized-R baseline (FIX 2): the 0.05-0.15*ATR
 # random offset makes the same setup grade to a different realized_r each run,
@@ -507,7 +524,12 @@ CSV_FIELDS=["ts_utc","symbol","cfd","side","strategy","score","setup_quality",
     # FIX 1: magnitude columns added alongside the W/L/N/NF outcome. atr15 is
     # captured at signal time so grade_signal() can model the Chandelier trail
     # deterministically later, without needing 14+ bars in the eval window.
-    "atr15","mfe_r","mae_r","exit_tier","realized_r"]
+    "atr15","mfe_r","mae_r","exit_tier","realized_r",
+    # FIX 4/5 observation columns (always logged; only drive alerts when the
+    # matching flag is on). tp2_pattern = measured-move / opposing-liquidity target,
+    # tp2_pattern_r = its distance from entry in R; score_v2 = the FIX-5 rescored
+    # value, gate_v2_pass = whether the >=2/3 indicator gate passed.
+    "tp2_pattern","tp2_pattern_r","score_v2","gate_v2_pass"]
 
 def _migrate_csv_schema():
     """One-time migration when the on-disk header is older than CSV_FIELDS.
@@ -814,7 +836,9 @@ def is_choppy(m15c):
 def indicator_score(m15c, side):
     """RSI checks DIRECTION (falling/rising) not just level.
     Smart Trading Framework: 'RSI falling' for bearish, 'RSI rising' for bullish.
-    Returns (points 0-10, reasons list). Needs >= 2/3 indicators aligned."""
+    Returns (points 0-10, reasons list, aligned_count 0-3). `aligned_count` is the
+    raw number of the three indicators pointing the trade's way — FIX 5 uses it as a
+    pass/fail gate (>=2) instead of adding the points."""
     pts=0; reasons=[]
     r_series=rsi(m15c,14)
     r=float(r_series.iloc[-1]); r_prev=float(r_series.iloc[-3])
@@ -834,7 +858,7 @@ def indicator_score(m15c, side):
         score=4; reasons.append(f"weak indicator conf ({pts}/3)")
     else:
         score=0
-    return score, reasons
+    return score, reasons, pts
 
 # =====================================================================================
 # Liquidity levels (fractal — shared across strategies)
@@ -1026,6 +1050,7 @@ def detect_double_pattern(name,cfg,m15c,atr15,side):
                         results.append({"strategy":"double-top","side":"short",
                             "entry":close,"stop":max(p_i,p_j)+STOP_BUFFER_ATR*atr15,
                             "level_name":"double-top neckline","level_price":neckline,
+                            "pat_height":pat_height,
                             "base_score":35,"pattern_bonus":min(8,int(pat_height/atr15*3)),
                             "reasons":[f"double top at {max(p_i,p_j):.2f}, neckline {neckline:.2f} broken"]})
                         break
@@ -1047,6 +1072,7 @@ def detect_double_pattern(name,cfg,m15c,atr15,side):
                     results.append({"strategy":"head-shoulders","side":"short",
                         "entry":close,"stop":p_r+STOP_BUFFER_ATR*atr15,
                         "level_name":"H&S neckline","level_price":neckline,
+                        "pat_height":pat_height,
                         "base_score":37,"pattern_bonus":min(10,int(pat_height/atr15*3)),
                         "reasons":[f"H&S: head {p_h:.2f}, shoulders {p_l:.2f}/{p_r:.2f}, neckline {neckline:.2f} broken"]})
                     break
@@ -1066,6 +1092,7 @@ def detect_double_pattern(name,cfg,m15c,atr15,side):
                         results.append({"strategy":"double-bottom","side":"long",
                             "entry":close,"stop":min(p_i,p_j)-STOP_BUFFER_ATR*atr15,
                             "level_name":"double-bottom neckline","level_price":neckline,
+                            "pat_height":pat_height,
                             "base_score":35,"pattern_bonus":min(8,int(pat_height/atr15*3)),
                             "reasons":[f"double bottom at {min(p_i,p_j):.2f}, neckline {neckline:.2f} broken"]})
                         break
@@ -1085,6 +1112,7 @@ def detect_double_pattern(name,cfg,m15c,atr15,side):
                     results.append({"strategy":"inv-head-shoulders","side":"long",
                         "entry":close,"stop":p_r-STOP_BUFFER_ATR*atr15,
                         "level_name":"inv H&S neckline","level_price":neckline,
+                        "pat_height":pat_height,
                         "base_score":37,"pattern_bonus":min(10,int(pat_height/atr15*3)),
                         "reasons":[f"inv H&S: head {p_h:.2f}, shoulders {p_l:.2f}/{p_r:.2f}, neckline {neckline:.2f} broken"]})
                     break
@@ -1218,14 +1246,23 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
     # ---- Smart Trading Framework: 3 confirmation factors ----------------------------
 
     # Factor 1: Indicator confirmation (RSI + MACD + EMA)
-    ind_pts, ind_reasons = indicator_score(m15c, side)
+    ind_pts, ind_reasons, ind_aligned = indicator_score(m15c, side)
     score += ind_pts; reasons += ind_reasons
 
     # Factor 2: Multi-timeframe alignment
     if (side=="short" and bias=="bear") or (side=="long" and bias=="bull"):
-        score+=15; reasons.append(f"HTF bias {bias} aligned")
-    elif bias=="neutral": score+=5
-    else: score-=8; reasons.append(f"counter-trend vs HTF {bias} (-8)")
+        htf_live=15; reasons.append(f"HTF bias {bias} aligned")
+    elif bias=="neutral": htf_live=5
+    else: htf_live=-8; reasons.append(f"counter-trend vs HTF {bias} (-8)")
+    score+=htf_live
+
+    # FIX 5 (observe-only unless SCORE_MODEL_V2): recompute the score with the
+    # HTF-aligned bonus reduced 15->10 and the indicator points removed (indicator
+    # becomes a >=2/3 gate instead). Everything else added below applies to both,
+    # so deriving score_v2 as a delta keeps them in lockstep.
+    htf_v2 = 10 if htf_live==15 else htf_live      # only the +15 case changes
+    gate_v2_pass = ind_aligned>=2
+    v2_delta = (htf_v2-htf_live) - ind_pts          # swap HTF, drop indicator points
 
     # Factor 3: Session timing (per-instrument weights)
     hr=now.hour+now.minute/60.0
@@ -1316,6 +1353,25 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
     else:
         tp2=entry+sgn*TP2_RR*risk
 
+    # ---- FIX 4: pattern-specific target (observe-only unless PATTERN_TARGETS_ENABLED) --
+    # Reversal patterns -> measured move projected from the neckline (level_price).
+    # Zone-rejection -> nearest opposing liquidity (the runner). Logged always; only
+    # replaces the live TP2 when the flag is on AND it sits beyond TP1 in-direction.
+    pat_tp2=None
+    if raw["strategy"] in ("double-top","double-bottom","head-shoulders","inv-head-shoulders") \
+       and raw.get("pat_height"):
+        pat_tp2=raw["level_price"]+sgn*abs(float(raw["pat_height"]))
+    elif raw["strategy"]=="zone-rejection" and runner is not None:
+        pat_tp2=runner
+    pat_tp2_r=(abs(pat_tp2-entry)/risk) if pat_tp2 is not None else None
+    if PATTERN_TARGETS_ENABLED and pat_tp2 is not None and sgn*(pat_tp2-tp1)>0:
+        tp2=pat_tp2
+
+    # ---- FIX 5: finalize score under the active model --------------------------------
+    score_v2=score+v2_delta
+    if SCORE_MODEL_V2:
+        score=score_v2
+
     # pace check
     hours_avail=min(MAX_HOLD_HOURS,max(0,(flat_by-now).total_seconds()/3600))
     reachable=0.5*atr1h*hours_avail
@@ -1336,6 +1392,11 @@ def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_b
         "key":f"{symbol_name}:{side}:{raw['strategy']}:{round(raw['level_price'],1)}",
         # Non-sweep strategies always pass the BOS gate; sweep sets it explicitly.
         "bos_confirmed": raw.get("bos_confirmed", True),
+        # FIX 4/5 observation fields (logged; gate_v2 also enforced when flag on).
+        "tp2_pattern":  round(pat_tp2,2) if pat_tp2 is not None else "",
+        "tp2_pattern_r":round(pat_tp2_r,3) if pat_tp2_r is not None else "",
+        "score_v2":     round(min(100.0,score_v2),1),
+        "gate_v2_pass": gate_v2_pass,
     }
 
 # =====================================================================================
@@ -1645,6 +1706,15 @@ def run_cycle(loop_mode):
             else:
                 continue
 
+        # FIX 5 gate (only when SCORE_MODEL_V2 is on): <2/3 indicators aligned caps
+        # the tier at WATCH — same detect-generously / grade-strictly shape as FIX 3.
+        if SCORE_MODEL_V2 and tier=="A+" and not c.get("gate_v2_pass", True):
+            if st.get("watch_sent",0)<MAX_WATCH_PER_DAY:
+                tier="WATCH"
+                c["reasons"].append("indicator gate <2/3 → WATCH")
+            else:
+                continue
+
         if tg_send(alert_text(c,cfg,tier,now,st)):
             log(f"ALERT {tier} {c['symbol']} {c['strategy']} {c['side']} score {c['score']}")
             c["alerted"]=tier
@@ -1669,7 +1739,9 @@ def run_cycle(loop_mode):
                 "reasons":" | ".join(c["reasons"]),"alerted":c.get("alerted",""),
                 "outcome":"","exit_price":"","pnl_usd":"","hold_minutes":"","lessons":"",
                 "atr15":round(c["atr15"],4),
-                "mfe_r":"","mae_r":"","exit_tier":"","realized_r":""})
+                "mfe_r":"","mae_r":"","exit_tier":"","realized_r":"",
+                "tp2_pattern":c.get("tp2_pattern",""),"tp2_pattern_r":c.get("tp2_pattern_r",""),
+                "score_v2":c.get("score_v2",""),"gate_v2_pass":c.get("gate_v2_pass","")})
     push_status_json(st, last_scores, now)
     save_state(st)
 
