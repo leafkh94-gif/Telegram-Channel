@@ -126,6 +126,26 @@ PATTERN_TARGETS_ENABLED=False
 #   (gate-fail caps the tier at WATCH, mirroring the FIX 3 BOS gate — never dropped).
 SCORE_MODEL_V2=False
 
+# ---- Entry-confirmation gates -------------------------------------------------------
+# Three checks meant to stop late / counter setups that fill then get stopped:
+#   1. rejection candle : the last closed M15 must be a pin-bar rejecting the level
+#   2. opposing H1 impulse : block only if the H1 EMA20/50 has actually flipped
+#      against the trade (a normal pullback is fine; a reversal is not)
+#   3. leg extension : skip when the recent M15 leg is already stretched many ATRs
+#      (correction is late, target room is small)
+# Mode: "off" = don't compute; "observe" = compute + log gates_pass/gates_reasons but
+# DON'T change any tier (default — collects data without disturbing the FIX 4/5
+# baseline); "live" = additionally cap A+ -> WATCH when the gates fail (same
+# detect-generously / grade-strictly shape as the FIX 3 BOS gate — never dropped).
+ENTRY_GATES_MODE="observe"
+GATE_CFG={
+    "XAUUSD":{"min_wick_ratio":1.3,"close_zone":0.55,"max_leg_ext":6.0},
+    "US500": {"min_wick_ratio":1.5,"close_zone":0.60,"max_leg_ext":4.5},
+    "US100": {"min_wick_ratio":1.5,"close_zone":0.60,"max_leg_ext":4.5},
+    "US30":  {"min_wick_ratio":1.5,"close_zone":0.60,"max_leg_ext":4.5},
+}
+GATE_LEG_LOOKBACK=20   # M15 bars used to measure the recent swing for gate #3
+
 # ---- Stop randomization (exit-strategies) -------------------------------------------
 # Disabled while collecting the realized-R baseline (FIX 2): the 0.05-0.15*ATR
 # random offset makes the same setup grade to a different realized_r each run,
@@ -529,7 +549,10 @@ CSV_FIELDS=["ts_utc","symbol","cfd","side","strategy","score","setup_quality",
     # matching flag is on). tp2_pattern = measured-move / opposing-liquidity target,
     # tp2_pattern_r = its distance from entry in R; score_v2 = the FIX-5 rescored
     # value, gate_v2_pass = whether the >=2/3 indicator gate passed.
-    "tp2_pattern","tp2_pattern_r","score_v2","gate_v2_pass"]
+    "tp2_pattern","tp2_pattern_r","score_v2","gate_v2_pass",
+    # Entry-confirmation gates (observe/live): whether the setup passed all three
+    # gates, and which ones it failed. Logged for every candidate when gates are on.
+    "gates_pass","gates_reasons"]
 
 def _migrate_csv_schema():
     """One-time migration when the on-disk header is older than CSV_FIELDS.
@@ -859,6 +882,51 @@ def indicator_score(m15c, side):
     else:
         score=0
     return score, reasons, pts
+
+# =====================================================================================
+# Entry-confirmation gates (bot_entry_gates — adapted to this bot's data model)
+# =====================================================================================
+# Ported from the standalone bot_entry_gates spec. Adapted: this bot's frames use
+# capitalized OHLC columns and carry a monotonic UTC DatetimeIndex (candle order is
+# already guaranteed by _cap_fetch's sort — so the spec's "Fix 0" order guard is not
+# repeated here). ATR reuses this file's atr(); the H1 impulse reuses ema().
+
+def _confirms_rejection(candle, side, min_wick_ratio, close_zone):
+    """True if `candle` (an M15 row) is a pin-bar rejecting in the trade's favor."""
+    o=float(candle["Open"]); h=float(candle["High"]); l=float(candle["Low"]); c=float(candle["Close"])
+    rng=max(h-l,1e-9); body=max(abs(c-o),1e-9)
+    lower_wick=min(o,c)-l; upper_wick=h-max(o,c)
+    if side=="long":
+        return bool(lower_wick>=min_wick_ratio*body and c>=l+close_zone*rng)
+    return bool(upper_wick>=min_wick_ratio*body and c<=h-close_zone*rng)
+
+def _opposing_impulse(h1c, side, ema_fast=20, ema_slow=50, slope_lookback=3):
+    """True if the H1 EMA20/50 has FLIPPED against the trade (block), as opposed to a
+    normal pullback (allow). Returns False (don't block) when H1 history is too short."""
+    if h1c is None or len(h1c)<=ema_slow+slope_lookback:
+        return False
+    ef=ema(h1c["Close"],ema_fast); es=ema(h1c["Close"],ema_slow)
+    es_slope=float(es.iloc[-1]-es.iloc[-1-slope_lookback])
+    if side=="long":
+        return bool(ef.iloc[-1]<es.iloc[-1] and es_slope<0)
+    return bool(ef.iloc[-1]>es.iloc[-1] and es_slope>0)
+
+def entry_gates_result(side, m15c, h1c, atr15, cfd):
+    """Run all three entry gates. Returns (passed: bool, reasons: list[str]).
+    Gate #3's 'leg' is the recent M15 swing over GATE_LEG_LOOKBACK bars — a
+    strategy-agnostic proxy for how extended the current move already is."""
+    cfg=GATE_CFG.get(cfd,GATE_CFG["US500"])
+    reasons=[]
+    if not _confirms_rejection(m15c.iloc[-1],side,cfg["min_wick_ratio"],cfg["close_zone"]):
+        reasons.append("no_rejection_candle")
+    if _opposing_impulse(h1c,side):
+        reasons.append("opposing_h1_impulse")
+    seg=m15c.tail(GATE_LEG_LOOKBACK)
+    swing=float(seg["High"].max())-float(seg["Low"].min())
+    ext=(swing/atr15) if atr15 and atr15>0 else 0.0
+    if ext>cfg["max_leg_ext"]:
+        reasons.append(f"leg_too_extended_{ext:.1f}atr")
+    return (len(reasons)==0, reasons)
 
 # =====================================================================================
 # Liquidity levels (fractal — shared across strategies)
@@ -1647,6 +1715,10 @@ def run_cycle(loop_mode):
                     if choppy:
                         c["score"]=max(0,c["score"]-10)
                         c["reasons"].append("choppy market (-10)")
+                    # Entry-confirmation gates (observe/live per ENTRY_GATES_MODE)
+                    if ENTRY_GATES_MODE!="off":
+                        gp,gr=entry_gates_result(c["side"],m15c,h1c,atr15,cfg["cfd"])
+                        c["gates_pass"]=gp; c["gates_reasons"]=";".join(gr)
                     st["evaluated"]=st.get("evaluated",0)+1
                     all_candidates.append((c,cfg))
                     # track best score per symbol for status dashboard
@@ -1715,6 +1787,15 @@ def run_cycle(loop_mode):
             else:
                 continue
 
+        # Entry gates (only when ENTRY_GATES_MODE=="live"): failed confirmation caps
+        # A+ -> WATCH. In "observe" mode the result is logged but never changes tier.
+        if ENTRY_GATES_MODE=="live" and tier=="A+" and not c.get("gates_pass", True):
+            if st.get("watch_sent",0)<MAX_WATCH_PER_DAY:
+                tier="WATCH"
+                c["reasons"].append("entry gates failed ("+c.get("gates_reasons","")+") → WATCH")
+            else:
+                continue
+
         if tg_send(alert_text(c,cfg,tier,now,st)):
             log(f"ALERT {tier} {c['symbol']} {c['strategy']} {c['side']} score {c['score']}")
             c["alerted"]=tier
@@ -1741,7 +1822,8 @@ def run_cycle(loop_mode):
                 "atr15":round(c["atr15"],4),
                 "mfe_r":"","mae_r":"","exit_tier":"","realized_r":"",
                 "tp2_pattern":c.get("tp2_pattern",""),"tp2_pattern_r":c.get("tp2_pattern_r",""),
-                "score_v2":c.get("score_v2",""),"gate_v2_pass":c.get("gate_v2_pass","")})
+                "score_v2":c.get("score_v2",""),"gate_v2_pass":c.get("gate_v2_pass",""),
+                "gates_pass":c.get("gates_pass",""),"gates_reasons":c.get("gates_reasons","")})
     push_status_json(st, last_scores, now)
     save_state(st)
 
