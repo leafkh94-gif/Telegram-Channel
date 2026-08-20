@@ -1,175 +1,106 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sweep_alert_agent.py  v3.0 — Multi-Strategy Edition
-====================================================
-5-strategy intraday alert agent for Gold (XAUUSD) and US index CFDs.
+sweep_alert_agent.py — HYBRID SMC-MACRO TRADING BOT (v1.0)
+==========================================================
+7-layer Smart-Money-Concepts + Macro alert pipeline for Gold (XAUUSD) and the
+US index CFDs (US500 / US100 / US30). Implements the "HYBRID SMC-MACRO TRADING
+BOT — Technical Specification v1.0".
 
-THE LIVE ALERT BOT IS THIS ONE FILE. The strategy/, agents/, execution/
-folders and main.py / main_live.py are dead code — nothing this bot runs at
-runtime imports them. Edit those and you're editing paper: the live agent
-will not see it. All changes to signal generation, scoring, exit modeling,
-CSV logging, and digest formatting belong in this file.
+THE LIVE ALERT BOT IS THIS ONE FILE. The strategy/, agents/, execution/ folders
+and main.py / main_live.py are dead code — nothing this bot runs at runtime
+imports them. All signal logic belongs in this file.
 
-STRATEGIES (from "The Short Trader's Playbook" + Smart Trading Framework):
-  1. Supply Zone / Order Block Rejection
-  2. Liquidity Sweep + Break of Structure (ICT/SMC)
-  3. Double Top / Double Bottom
-  4. Bear Flag / Bull Flag continuation
-  5. Post-News Momentum Retest
+Operating mode: ALERT_ONLY. The bot analyses the market and sends a Telegram
+signal; it NEVER places an order. SEMI_AUTO / FULL_AUTO real-order execution,
+the inbound Telegram command interface (/status, /stats, …), the trade-outcome
+P&L database, and the loss circuit-breakers are execution-tier and intentionally
+deferred until this alert pipeline is validated on ~30 setups (per the spec's
+own rollout checklist).
 
-SIGNAL FRAMEWORK (Smart Trading Framework):
-  Price action confirmation = MANDATORY (each strategy provides this)
-  + at least 2 of:  Indicator confirmation (RSI, MACD, EMA)
-                     Multi-timeframe alignment (H4 bias)
-                     Session timing (London / NY overlap)
-  Weak (Price+1)   = skip     | Tradeable (Price+2) = WATCH
-  Strong (Price+3) = A+       | RR >= 1:2.0 mandatory
-
-SKILLS INTEGRATED:
-  strategy-framework  — edge hypothesis, performance criteria, lifecycle
-  risk-management     — loss-streak circuit breakers, daily/weekly limits
-  trade-journal       — 18-field CSV, behavioral detection, review cadence
-  exit-strategies     — scaled exits (TP1+trail), time stops, stop randomization
+Pipeline (each layer must pass before the next; a failure aborts the scan for
+that instrument):
+  Layer 1  Macro Filter        — news (±60m HIGH) · DXY bias (XAUUSD) · VIX
+  Layer 2  HTF Structure Bias  — Weekly → Daily swings, BOS / CHOCH
+  Layer 3  Liquidity Mapping   — 4H BSL / SSL pools, nearest unmitigated draw
+  Layer 4  POI Detection+Score — 4H Order Block / FVG / Breaker, graded A+/A/B/C
+  Layer 5  LTF Entry Signal    — 15M sweep → 15M CHOCH → 5M FVG 50% entry
+  Layer 6  Risk Validation     — SL beyond OB, TP1/TP2 liquidity, RR gate
+  Layer 7  Checklist Gate      — 10 conditions, 5 critical, >= 8/10
 
 Run:  python sweep_alert_agent.py [--test | --once]
-Env:  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Env:  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+      CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD
 Deps: pip install pandas requests
 """
 
-import os, sys, csv, json, time, math, random, traceback, threading, base64
+import os, sys, csv, json, time, traceback, threading, base64
 from datetime import datetime, timedelta, timezone
 import requests, pandas as pd
-import yfinance as yf   # used by the Yahoo fallback + --test path (fetch())
 
 # =====================================================================================
 # CONFIG
 # =====================================================================================
 
-SYMBOLS = {
-    "GOLD":   {"yf":"GC=F",  "kind":"gold",  "cfd":"XAUUSD","per_lot_per_pt":100.0,"round_step":50.0,
-               "session_bonus":{"london":8,"ny":8},  "atr_sl_max":1.5,"atr_sl_min":0.55},
-    "SP500":  {"yf":"ES=F",  "kind":"index", "cfd":"US500", "per_lot_per_pt":1.0,  "round_step":100.0,
-               "session_bonus":{"london":4,"ny":10}, "atr_sl_max":1.8,"atr_sl_min":0.65},
-    "NASDAQ": {"yf":"NQ=F",  "kind":"index", "cfd":"US100", "per_lot_per_pt":1.0,  "round_step":250.0,
-               "session_bonus":{"london":3,"ny":10}, "atr_sl_max":2.0,"atr_sl_min":0.70},
-    "DOW":    {"yf":"YM=F",  "kind":"index", "cfd":"US30",  "per_lot_per_pt":1.0,  "round_step":500.0,
-               "session_bonus":{"london":4,"ny":10}, "atr_sl_max":1.8,"atr_sl_min":0.65},
+# Per-instrument configuration. XAUUSD is the only instrument the DXY bias filter
+# applies to (indices skip it, per spec 2.2). pip / pip_value drive the informational
+# SL-in-pips and lot-size figures shown in the alert (ALERT_ONLY — never an order).
+INSTRUMENTS = {
+    "XAUUSD": {"epic": "GOLD",  "pip": 0.01, "pip_value": 0.01, "dxy_filter": True},
+    "US500":  {"epic": "US500", "pip": 1.0,  "pip_value": 0.01, "dxy_filter": False},
+    "US100":  {"epic": "US100", "pip": 1.0,  "pip_value": 0.01, "dxy_filter": False},
+    "US30":   {"epic": "US30",  "pip": 1.0,  "pip_value": 0.01, "dxy_filter": False},
 }
-ENABLE_SHORTS = True
-ENABLE_LONGS  = True
 
-# ---- CFD lots -----------------------------------------------------------------------
-MIN_LOT_SIZE = 1.0;  LOT_STEP = 1.0
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "5000"))
+RISK_PCT        = 0.01     # 1% risk per trade (spec 7.4)
 
-# ---- Time (UTC) ---------------------------------------------------------------------
-# Market hours: Sun 22:00 UTC → Fri 21:00 UTC, daily close 21:00–22:00 UTC
-# (= Dubai: Mon 02:00 → Sat 01:00, daily close 01:00–02:00)
-HARD_FLAT_UTC="20:45"   # force-flat 15 min before daily close
-MAX_HOLD_HOURS=4.0; SCAN_EVERY_MIN=15
+# Structure / detection parameters (spec sections 3–6)
+WEEKLY_LOOKBACK   = 20     # weekly candles for swing structure
+DAILY_LOOKBACK    = 40     # daily candles for swing structure
+LIQ_LOOKBACK_4H   = 60     # 4H candles for liquidity pools
+SWING_L = 2; SWING_R = 2   # fractal: 2 left + 2 right
+SWING_MIN_SEP     = 3      # min candles between accepted swings
+EQUAL_LEVEL_TOL   = 0.001  # 0.1% — equal highs/lows grouping
+POI_NEAR_PCT      = 0.003  # price within 0.3% of a POI arms Layer 5
+LIQ_NEAR_PCT      = 0.002  # 0.2% — POI "near liquidity" confluence
+FIB_LOW, FIB_HIGH = 0.50, 0.705   # Fib confluence band (spec 5.2)
+IMPULSE_MIN       = 3      # a "strong move" is >= 3 candles
+CHOCH_MAX_CANDLES = 5      # 15M CHOCH must occur within 5 candles of the sweep
+FVG_RETRACE_MAX   = 8      # 5M candles to retrace into the FVG (order expiry proxy)
+POI_STALE_CANDLES = 20     # 4H POI older than this with no interaction → grade -1
 
-# ---- Alert controls -----------------------------------------------------------------
-# ── Adaptive Threshold ────────────────────────────────────────────────────────────────
-# The base A+ threshold is 75 points. But the bot adjusts it automatically each day:
-#
-#   • 3 consecutive days with no A+ signals  → threshold drops by 2 pts (floor: 65)
-#     "Market is slow — accept slightly lower-scoring setups"
-#
-#   • Daily A+ cap reached (4 alerts/day)    → threshold rises by 1 pt next day (ceil: 85)
-#     "Market is noisy — be more selective"
-#
-# (A loss-streak rule — 3 consecutive losses → +5 pts — existed once but was
-#  deliberately removed with the other loss-based circuit breakers in #33:
-#  this is an alert-only bot with no positions to protect.)
-#
-# Goal: at least one quality alert per day — no total silence, no noise flood.
-#
-# العتبة التكيفية (بالعربي):
-#  • 3 أيام بلا إشارات A+ → تنزل العتبة 2 نقطة (حد أدنى 65)
-#  • وصول الحد الأقصى (4 إشارات/يوم) → ترتفع نقطة واحدة (حد أقصى 85)
-# الهدف: تنبيهات بجودة معقولة كل يوم — لا صمت تام ولا فوضى.
-SCORE_A_PLUS=75; SCORE_A_PLUS_FLOOR=65; SCORE_A_PLUS_CEIL=85
-ADAPTIVE_THRESHOLD=True; SILENT_DAYS_TO_ADAPT=3
-SCORE_WATCH=62; MAX_APLUS_PER_DAY=4; MAX_WATCH_PER_DAY=999
-COOLDOWN_MIN_PER_SYMBOL=90; MIN_GAP_BETWEEN_ALERTS=30
+# Risk / RR (spec 7.2–7.3)
+SL_BUFFER_PIPS = 4         # 3–5 pips beyond the OB / FVG boundary (mid of range)
+RR_TP1_MIN     = 1.5
+RR_TP2_MIN     = 2.5
 
-# ---- Risk (playbook S3 + risk-management skill) ------------------------------------
-ACCOUNT_SIZE=5000.0; RISK_PCT=1.0; MIN_RR=2.0
-# STOP_BUFFER_ATR/STOP_ATR_MULT_MIN widened (0.15->0.35, 0.40->0.55) — stops sitting
-# right on the structural level were getting clipped by ordinary retest wicks before
-# the reversal confirmed, well below the ~33% breakeven win rate needed at 2:1 R:R.
-STOP_ATR_MULT_MAX=1.5; STOP_ATR_MULT_MIN=0.55; STOP_BUFFER_ATR=0.35
-PACE_SAFETY=0.80
-# Max distance a LIMIT entry may sit from current price (× ATR15) so it stays fillable.
-MAX_ENTRY_PULLBACK_ATR=0.8
+# Macro thresholds (spec 2 + tables 2/3)
+NEWS_IMPACT_CCY   = ("USD", "EUR", "GBP")
+NEWS_WINDOW_MIN   = 60     # ±60 minutes around a HIGH-impact event
+DXY_EMA           = 20
+DXY_NEUTRAL_PCT   = 0.003  # within 0.3% of the 20-EMA → NEUTRAL
+VIX_CAUTION       = 20     # 20–25 → lot ×0.75
+VIX_HIGH          = 25     # >25  → lot ×0.50
+VIX_HALT          = 35     # >35  → halt new entries
 
-# ---- Sweep-specific -----------------------------------------------------------------
-SWEEP_LOOKBACK=4; MAX_SWEEP_OVERSHOOT_ATR=1.5; MAX_EXTENSION_ATR=2.5
+# Grades that proceed to Layer 5 entry search
+PROCEED_GRADES = ("A", "A+")
 
-# ---- Scaled exits (exit-strategies) -------------------------------------------------
-TP1_RR=2.0; TP2_RR=3.0; TRAIL_ATR_MULT=2.5; TIME_STOP_HOURS=3.0
+DEDUP_HOURS       = 4      # don't re-alert the same fingerprint within 4H (spec 13 notes)
+MAX_PER_INSTR_DAY = 1      # spec 9.3 exposure limit (informational in ALERT_ONLY)
+SCAN_EVERY_MIN    = 5      # LTF cadence (spec 11.2)
 
-# ---- FIX 4 / FIX 5 demo flags (default OFF = observe-only) ---------------------------
-# Both fixes are "demo-test first": while OFF, they change NOTHING about live alerts,
-# tiers, or grading — they only compute alternative values that get logged to the CSV
-# (tp2_pattern / tp2_pattern_r for FIX 4, score_v2 / gate_v2_pass for FIX 5) so the new
-# behaviour can be compared against the realized-R baseline before it drives anything.
-# Flip a flag to True to let that fix drive live alerts, then re-tune the A+ threshold.
-#
-# FIX 4 — measured-move / opposing-liquidity TP2 for reversal + zone strategies:
-#   double-top/bottom & (inv-)head-shoulders -> neckline projected by pattern height;
-#   zone-rejection -> nearest opposing liquidity. Drives the TP2 shown in the alert
-#   only; TP1 (=2R) and the realized-R grading model are left untouched.
-PATTERN_TARGETS_ENABLED=False
-# FIX 5 — reduce trend double-counting: HTF-aligned bonus +15 -> +10, and the RSI/MACD/
-#   EMA indicator confirmation stops adding points and becomes a >=2/3 aligned GATE
-#   (gate-fail caps the tier at WATCH, mirroring the FIX 3 BOS gate — never dropped).
-SCORE_MODEL_V2=False
+STATE_FILE   = "smc_state.json"
+SIGNALS_CSV  = "smc_signals_log.csv"
+DUBAI        = timezone(timedelta(hours=4))
 
-# ---- Entry-confirmation gates -------------------------------------------------------
-# Three checks meant to stop late / counter setups that fill then get stopped:
-#   1. rejection candle : the last closed M15 must be a pin-bar rejecting the level
-#   2. opposing H1 impulse : block only if the H1 EMA20/50 has actually flipped
-#      against the trade (a normal pullback is fine; a reversal is not)
-#   3. leg extension : skip when the recent M15 leg is already stretched many ATRs
-#      (correction is late, target room is small)
-# Mode: "off" = don't compute; "observe" = compute + log gates_pass/gates_reasons but
-# DON'T change any tier (default — collects data without disturbing the FIX 4/5
-# baseline); "live" = additionally cap A+ -> WATCH when the gates fail (same
-# detect-generously / grade-strictly shape as the FIX 3 BOS gate — never dropped).
-ENTRY_GATES_MODE="observe"
-GATE_CFG={
-    "XAUUSD":{"min_wick_ratio":1.3,"close_zone":0.55,"max_leg_ext":6.0},
-    "US500": {"min_wick_ratio":1.5,"close_zone":0.60,"max_leg_ext":4.5},
-    "US100": {"min_wick_ratio":1.5,"close_zone":0.60,"max_leg_ext":4.5},
-    "US30":  {"min_wick_ratio":1.5,"close_zone":0.60,"max_leg_ext":4.5},
-}
-GATE_LEG_LOOKBACK=20   # M15 bars used to measure the recent swing for gate #3
-
-# ---- Stop randomization (exit-strategies) -------------------------------------------
-# Disabled while collecting the realized-R baseline (FIX 2): the 0.05-0.15*ATR
-# random offset makes the same setup grade to a different realized_r each run,
-# polluting the per-strategy expectancy measurement. Re-enable after the ~60-signal
-# baseline is in.
-STOP_RANDOMIZE=False; STOP_RAND_MIN=0.05; STOP_RAND_MAX=0.15
-
-# ---- News blackout ------------------------------------------------------------------
-RECURRING_BLACKOUTS_UTC=[("12:25","13:05"),("13:25","14:05")]
-EXTRA_BLACKOUTS_UTC=[]
-
-STATE_FILE="agent_state.json"; SIGNALS_CSV="signals_log.csv"
-DUBAI=timezone(timedelta(hours=4))
-
-# Capital.com epic mapping
-CAPITAL_EPICS = {
-    "GOLD":   "GOLD",
-    "SP500":  "US500",
-    "NASDAQ": "US100",
-    "DOW":    "US30",
-}
+# Capital.com epics for the macro symbols (best-effort; degrade gracefully if absent)
+DXY_EPIC = os.getenv("DXY_EPIC", "DXY")
+VIX_EPIC = os.getenv("VIX_EPIC", "VIX")
 
 # =====================================================================================
-# Capital.com data layer (shared singleton session)
+# Capital.com data layer (shared singleton session)  [preserved infra]
 # =====================================================================================
 
 _CAP_DEMO_BASE = "https://demo-api-capital.backend-capital.com/api/v1"
@@ -185,7 +116,7 @@ class _CapSession:
     def init(self):
         with self._lock:
             if self._cst: return
-            use_demo = os.getenv("CAPITAL_DEMO","").lower() == "true"
+            use_demo = os.getenv("CAPITAL_DEMO", "").lower() == "true"
             self._base = _CAP_DEMO_BASE if use_demo else _CAP_LIVE_BASE
             self._login()
             if not self._started:
@@ -193,9 +124,9 @@ class _CapSession:
                 self._started = True
 
     def _login(self):
-        api_key    = os.getenv("CAPITAL_API_KEY","").strip()
-        identifier = os.getenv("CAPITAL_IDENTIFIER","").strip()
-        password   = os.getenv("CAPITAL_PASSWORD","").strip()
+        api_key    = os.getenv("CAPITAL_API_KEY", "").strip()
+        identifier = os.getenv("CAPITAL_IDENTIFIER", "").strip()
+        password   = os.getenv("CAPITAL_PASSWORD", "").strip()
         r = requests.post(f"{self._base}/session",
             headers={"X-CAP-API-KEY": api_key, "Content-Type": "application/json"},
             json={"identifier": identifier, "password": password, "encryptedPassword": False},
@@ -231,1633 +162,802 @@ _cap_ready = False
 def _ensure_capital():
     global _cap_ready
     if _cap_ready: return True
-    key = os.getenv("CAPITAL_API_KEY","").strip()
+    key = os.getenv("CAPITAL_API_KEY", "").strip()
     if not key: return False
     try:
         _cap.init(); _cap_ready = True; return True
     except Exception as e:
         print(f"[Capital.com] login failed: {e}", flush=True); return False
 
-_CAP_RESOLUTION = {"15m": "MINUTE_15", "1h": "HOUR", "1d": "DAY"}
+# All timeframes the pipeline needs (spec 11.2).
+_CAP_RESOLUTION = {
+    "5m": "MINUTE_5", "15m": "MINUTE_15", "1h": "HOUR",
+    "4h": "HOUR_4",   "1d": "DAY",        "1w": "WEEK",
+}
 
 def _cap_fetch(epic, resolution, count):
+    """Fetch OHLC candles, oldest-first. Capital.com does NOT reliably return prices
+    in order and its snapshotTime is server-local — use snapshotTimeUTC and sort by
+    the real candle time (spec 12 / known candle-ordering bug)."""
     data = _cap.get(f"/prices/{epic}",
                     params={"resolution": _CAP_RESOLUTION[resolution], "max": count})
     rows = []
     for p in data.get("prices", []):
-        def mid(s): b=s.get("bid") or 0; a=s.get("ask") or 0; return (float(b)+float(a))/2 if b and a else float(b or a or 0)
+        def mid(s):
+            b = s.get("bid") or 0; a = s.get("ask") or 0
+            return (float(b) + float(a)) / 2 if b and a else float(b or a or 0)
         try:
-            # Capital.com returns snapshotTime in the SERVER's timezone; the UTC
-            # value is the separate snapshotTimeUTC field. Parsing snapshotTime as
-            # UTC shifts every candle by the server offset, which breaks the
-            # closed-bar freshness gate and grades alerts against pre-alert candles.
             ts = pd.Timestamp(p.get("snapshotTimeUTC") or p["snapshotTime"], tz="UTC")
             rows.append({"ts": ts,
                          "Open": mid(p["openPrice"]), "High": mid(p["highPrice"]),
                          "Low": mid(p["lowPrice"]),  "Close": mid(p["closePrice"])})
-        except: pass
+        except Exception:
+            pass
     if not rows: return None
-    # Use the REAL candle time as the index and sort chronologically. Capital.com
-    # does not reliably return prices oldest-first, so we must never assume order:
-    # fabricating an ordered index silently reverses the series in time.
     df = pd.DataFrame(rows).set_index("ts").sort_index()
     df = df[~df.index.duplicated(keep="last")]
     return df
 
 # =====================================================================================
-# Utilities + Telegram
+# Utilities + Telegram  [preserved infra]
 # =====================================================================================
 
 def now_utc(): return datetime.now(timezone.utc)
 def log(msg): print(f"[{now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC] {msg}", flush=True)
-def hhmm_today(now,hhmm):
-    h,m=(int(x) for x in hhmm.split(":")); return now.replace(hour=h,minute=m,second=0,microsecond=0)
 def fmt_both(dt): return f"{dt.strftime('%H:%M')} UTC ({dt.astimezone(DUBAI).strftime('%H:%M')} Dubai)"
 
 def is_market_closed(now):
-    """
-    Market is closed when:
-      - Weekend window: Friday 21:00 UTC → Sunday 22:00 UTC
-        (Dubai: Saturday 01:00 → Monday 02:00)
-      - Daily close:    21:00–22:00 UTC every day
-        (Dubai: 01:00–02:00)
-    """
-    wd = now.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
-    hm = now.hour * 60 + now.minute
-    daily_close_start = 21 * 60   # 21:00 UTC
-    daily_close_end   = 22 * 60   # 22:00 UTC
-    # Daily maintenance window
-    if daily_close_start <= hm < daily_close_end:
-        return True
-    # Saturday: always closed
-    if wd == 5:
-        return True
-    # Friday after 21:00 UTC: closed
-    if wd == 4 and hm >= daily_close_start:
-        return True
-    # Sunday before 22:00 UTC: closed
-    if wd == 6 and hm < daily_close_end:
-        return True
+    """Closed on the weekend window (Fri 21:00 UTC → Sun 22:00 UTC) and during the
+    daily maintenance close (21:00–22:00 UTC)."""
+    wd = now.weekday(); hm = now.hour * 60 + now.minute
+    if 21 * 60 <= hm < 22 * 60: return True   # daily close
+    if wd == 5: return True                    # Saturday
+    if wd == 4 and hm >= 21 * 60: return True  # Friday after 21:00
+    if wd == 6 and hm < 22 * 60: return True   # Sunday before 22:00
     return False
-
-def in_blackout(now):
-    t=now.strftime("%H:%M")
-    for s,e in RECURRING_BLACKOUTS_UTC:
-        if s<=t<e: return True
-    for s,e in EXTRA_BLACKOUTS_UTC:
-        try:
-            sdt=datetime.strptime(s,"%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            edt=datetime.strptime(e,"%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            if sdt<=now<edt: return True
-        except ValueError: pass
-    return False
-
-def recently_exited_blackout(now, minutes=45):
-    """True if a blackout window ended within the last N minutes."""
-    t=now.strftime("%H:%M")
-    for _,e in RECURRING_BLACKOUTS_UTC:
-        eh,em=(int(x) for x in e.split(":"))
-        end=now.replace(hour=eh,minute=em,second=0,microsecond=0)
-        if timedelta(0) <= (now - end) <= timedelta(minutes=minutes):
-            return True
-    return False
-
-# =====================================================================================
-# Live economic calendar (free, no API key) — real high-impact USD events
-# =====================================================================================
-# The fixed RECURRING_BLACKOUTS_UTC above are a rough guess at data-release times.
-# This layer pulls the actual weekly calendar so the bot (a) pauses around real
-# high-impact USD events (which drive gold AND the US indices), and (b) can name
-# the real event in Post-News Retest alerts. If the feed is unreachable, everything
-# falls back gracefully to the fixed windows — no crash, no missed scans.
-
-ECON_CAL_URL   = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-NEWS_BUFFER_MIN = 30    # pause this many minutes before AND after a high-impact event
-_econ_cache = {"fetched": None, "events": []}
-
-def _parse_econ_dt(s):
-    try:
-        dt=datetime.fromisoformat(s)
-        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def _fetch_econ_calendar():
-    try:
-        r=requests.get(ECON_CAL_URL, timeout=_CAP_TIMEOUT,
-                       headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        events=[]
-        for e in r.json():
-            if str(e.get("impact","")).lower()!="high":
-                continue
-            if str(e.get("country","")).upper()!="USD":   # USD drives gold + US indices
-                continue
-            dt=_parse_econ_dt(e.get("date"))
-            if dt: events.append({"title": str(e.get("title","event")), "time": dt})
-        return events
-    except Exception:
-        return None
-
-def get_econ_events(now):
-    """Cached high-impact USD events for the week; refreshed every 6h."""
-    if _econ_cache["fetched"] is None or (now-_econ_cache["fetched"])>timedelta(hours=6):
-        ev=_fetch_econ_calendar()
-        if ev is not None:
-            _econ_cache["events"]=ev; _econ_cache["fetched"]=now
-    return _econ_cache["events"]
-
-def in_econ_blackout(now):
-    """Return the event title if we're within NEWS_BUFFER_MIN of a high-impact event."""
-    for e in get_econ_events(now):
-        if abs((now-e["time"]).total_seconds())<=NEWS_BUFFER_MIN*60:
-            return e["title"]
-    return None
-
-def recent_econ_event(now, minutes=45):
-    """Return the title of a high-impact event that fired within the last N minutes."""
-    best=None
-    for e in get_econ_events(now):
-        d=(now-e["time"]).total_seconds()
-        if 0<=d<=minutes*60: best=e["title"]
-    return best
 
 def tg_send(text):
-    token=os.environ.get("TELEGRAM_BOT_TOKEN","").strip()
-    chat=os.environ.get("TELEGRAM_CHAT_ID","").strip()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat:
         log("Telegram env vars missing."); print(text, flush=True); return False
     try:
-        r=requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                        json={"chat_id":chat,"text":text,"disable_web_page_preview":True},timeout=15)
-        return r.status_code==200
-    except requests.RequestException: return False
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": text, "disable_web_page_preview": True},
+                          timeout=15)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
 
 # =====================================================================================
-# State
+# State  (dedup fingerprints, per-day counts, macro cache)
 # =====================================================================================
 
-def default_state(today_str,threshold):
-    return {"date":today_str,"threshold":threshold,"silent_days":0,"aplus_sent":0,
-            "watch_sent":0,"last_alert_ts":{},"last_any_alert_ts":None,"sent_keys":[],
-            "best_today":None,"digest_sent":False,"evaluated":0}
+def default_state(today_str):
+    return {"date": today_str, "signals_sent": 0, "per_instrument": {},
+            "fingerprints": {}, "macro": None, "macro_ts": None}
 
 def load_state():
-    today_str=now_utc().date().isoformat()
+    today = now_utc().date().isoformat()
     try:
-        with open(STATE_FILE,"r") as f: st=json.load(f)
-    except (FileNotFoundError,json.JSONDecodeError):
-        return default_state(today_str,float(SCORE_A_PLUS))
-    if st.get("date")!=today_str:
-        thr=float(st.get("threshold",SCORE_A_PLUS))
-        silent=int(st.get("silent_days",0))
-        if st.get("aplus_sent",0)==0 and st.get("watch_sent",0)==0: silent+=1
-        else: silent=0
-        if ADAPTIVE_THRESHOLD:
-            if silent>=SILENT_DAYS_TO_ADAPT: thr=max(SCORE_A_PLUS_FLOOR,thr-2); silent=0
-            elif st.get("aplus_sent",0)>=MAX_APLUS_PER_DAY: thr=min(SCORE_A_PLUS_CEIL,thr+1)
-        ns=default_state(today_str,thr)
-        ns["silent_days"]=silent
+        with open(STATE_FILE, "r") as f: st = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default_state(today)
+    if st.get("date") != today:
+        # New day: reset counters but keep macro cache (it re-fetches on staleness).
+        ns = default_state(today)
+        ns["macro"] = st.get("macro"); ns["macro_ts"] = st.get("macro_ts")
+        # keep only fingerprints still inside the dedup window
+        cutoff = now_utc() - timedelta(hours=DEDUP_HOURS)
+        ns["fingerprints"] = {k: v for k, v in st.get("fingerprints", {}).items()
+                              if _parse_ts(v) and _parse_ts(v) > cutoff}
         return ns
     return st
 
 def save_state(st):
     try:
-        with open(STATE_FILE,"w") as f: json.dump(st,f,indent=2)
+        with open(STATE_FILE, "w") as f: json.dump(st, f, indent=2)
     except OSError: pass
-
-def strategy_winrates():
-    """Return {strategy: (wins, total)} from all graded W/L signals."""
-    stats={}
-    if not os.path.exists(SIGNALS_CSV): return stats
-    try:
-        with open(SIGNALS_CSV,"r") as f:
-            for row in csv.DictReader(f):
-                if row.get("alerted") in ("A+","WATCH") and row.get("outcome") in ("W","L"):
-                    strat=row.get("strategy","?")
-                    w,t=stats.get(strat,(0,0))
-                    stats[strat]=(w+(1 if row["outcome"]=="W" else 0), t+1)
-    except Exception:
-        pass
-    return stats
-
-def friendly_strategy(strat):
-    """Turn a raw strategy key like 'liquidity-sweep' into 'Liquidity Sweep'."""
-    if not strat: return "?"
-    if ":" in strat: strat=strat.split(":",1)[1].strip()   # strip "Strategy N:" prefix
-    return strat.replace("-"," ").replace("_"," ").title()
-
-def outcome_breakdown(n=30):
-    """Return counts of the most recent n graded alerts, broken down plainly:
-    W=took profit, L=hit stop, NF=never reached entry, N=filled but still open."""
-    seq=[]
-    if not os.path.exists(SIGNALS_CSV): return {}
-    try:
-        with open(SIGNALS_CSV,"r") as f:
-            for row in csv.DictReader(f):
-                if row.get("alerted") in ("A+","WATCH") and row.get("outcome") in ("W","L","N","NF"):
-                    seq.append(row["outcome"])
-    except Exception:
-        pass
-    seq=seq[-n:]
-    return {"W":seq.count("W"),"L":seq.count("L"),"N":seq.count("N"),
-            "NF":seq.count("NF"),"total":len(seq)}
-
-def fill_stats():
-    """Return (filled, no_fill) counts across all graded signals.
-    filled = W+L+N (price returned to entry); no_fill = NF (never triggered)."""
-    filled=0; nofill=0
-    if not os.path.exists(SIGNALS_CSV): return (0,0)
-    try:
-        with open(SIGNALS_CSV,"r") as f:
-            for row in csv.DictReader(f):
-                if row.get("alerted") not in ("A+","WATCH"): continue
-                o=row.get("outcome")
-                if o in ("W","L","N"): filled+=1
-                elif o=="NF": nofill+=1
-    except Exception:
-        pass
-    return (filled,nofill)
-
-def strategy_realized_r_stats():
-    """Return {strategy: (n, mean_r, sum_r)} over CLOSED TRADES with a numeric
-    realized_r. Excluded: still-open trades (blank realized_r), never-filled
-    signals (outcome NF — the CSV stores their realized_r as 0.0 per the exit
-    model, but no trade happened, so counting them would dilute the per-trade
-    expectancy toward zero and disagree with the win-rate counts shown on the
-    same digest line), and pre-FIX-1 rows that have no realized_r column."""
-    buckets={}
-    if not os.path.exists(SIGNALS_CSV): return {}
-    try:
-        with open(SIGNALS_CSV,"r") as f:
-            for row in csv.DictReader(f):
-                if row.get("alerted") not in ("A+","WATCH"): continue
-                if row.get("outcome")=="NF": continue
-                rv=row.get("realized_r","")
-                if rv in ("", None): continue
-                try: v=float(rv)
-                except (ValueError,TypeError): continue
-                buckets.setdefault(row.get("strategy","?"), []).append(v)
-    except Exception:
-        pass
-    return {s:(len(vs), sum(vs)/len(vs), sum(vs)) for s,vs in buckets.items() if vs}
-
-OUTCOME_LABEL = {
-    "W":  "✅ Took profit",
-    "L":  "❌ Hit the stop (loss)",
-    "N":  "⏳ Entered, still no result yet",
-    "NF": "↩️ Price never reached entry",
-}
-
-def todays_signal_details(now):
-    """List every A+/WATCH alert sent today with its plain-language outcome.
-    Entirely automatic — grade_signal() replays real market candles; nothing here
-    requires a person to place or report a trade."""
-    out=[]
-    if not os.path.exists(SIGNALS_CSV): return out
-    today=now.date()
-    try:
-        with open(SIGNALS_CSV,"r") as f:
-            for row in csv.DictReader(f):
-                if row.get("alerted") not in ("A+","WATCH"): continue
-                ts=_parse_ts(row.get("ts_utc"))
-                if not ts or ts.date()!=today: continue
-                out.append({
-                    "symbol":   row.get("symbol","?"),
-                    "strategy": friendly_strategy(row.get("strategy","?")),
-                    "side":     row.get("side","?").upper(),
-                    "label":    OUTCOME_LABEL.get(row.get("outcome"), "🕐 Too early to grade yet"),
-                })
-    except Exception:
-        pass
-    return out
-
-# =====================================================================================
-# CSV logging (trade-journal 18-field)
-# =====================================================================================
-
-CSV_FIELDS=["ts_utc","symbol","cfd","side","strategy","score","setup_quality",
-    "entry","stop","tp1","tp2","trailing_method","time_stop",
-    "risk_pts","level","level_price","reasons","alerted",
-    "outcome","exit_price","pnl_usd","hold_minutes","lessons",
-    # FIX 1: magnitude columns added alongside the W/L/N/NF outcome. atr15 is
-    # captured at signal time so grade_signal() can model the Chandelier trail
-    # deterministically later, without needing 14+ bars in the eval window.
-    "atr15","mfe_r","mae_r","exit_tier","realized_r",
-    # FIX 4/5 observation columns (always logged; only drive alerts when the
-    # matching flag is on). tp2_pattern = measured-move / opposing-liquidity target,
-    # tp2_pattern_r = its distance from entry in R; score_v2 = the FIX-5 rescored
-    # value, gate_v2_pass = whether the >=2/3 indicator gate passed.
-    "tp2_pattern","tp2_pattern_r","score_v2","gate_v2_pass",
-    # Entry-confirmation gates (observe/live): whether the setup passed all three
-    # gates, and which ones it failed. Logged for every candidate when gates are on.
-    "gates_pass","gates_reasons"]
-
-def _migrate_csv_schema():
-    """One-time migration when the on-disk header is older than CSV_FIELDS.
-    The Actions workflow restores signals_log.csv from cache, so after a deploy
-    that adds columns the file still carries the old header; appending new-schema
-    rows under it misaligns every added column (atr15 etc. land in DictReader's
-    restkey and are destroyed on the next rewrite). Rewrite under the new header,
-    recovering any already-misaligned appended values from the restkey."""
-    try:
-        with open(SIGNALS_CSV,"r",newline="") as f:
-            header=next(csv.reader(f),None)
-        if header is None or header==CSV_FIELDS:
-            return
-        with open(SIGNALS_CSV,"r",newline="") as f:
-            rows=list(csv.DictReader(f))
-        # Columns are only ever appended, so the old header is a prefix of
-        # CSV_FIELDS and restkey extras map onto the new tail in order.
-        tail=CSV_FIELDS[len(header):]
-        for r in rows:
-            extra=r.pop(None,None)
-            if extra:
-                for fld,val in zip(tail,extra):
-                    r.setdefault(fld,val)
-        _rewrite_signals(rows)
-        log(f"signals_log.csv migrated: {len(header)} -> {len(CSV_FIELDS)} columns.")
-    except Exception:
-        pass
-
-def log_csv(row):
-    new=not os.path.exists(SIGNALS_CSV)
-    try:
-        if not new: _migrate_csv_schema()
-        with open(SIGNALS_CSV,"a",newline="") as f:
-            w=csv.DictWriter(f,fieldnames=CSV_FIELDS,extrasaction="ignore")
-            if new: w.writeheader()
-            w.writerow(row)
-    except: pass
-
-# =====================================================================================
-# Automatic outcome tracking — grade past alerts as W / L / N against later price
-# =====================================================================================
-# The bot is alert-only (no live account), so nothing reports back whether a signal
-# won or lost. This closes that loop: a few hours after each alert we replay the
-# 15-minute candles. Because entries are LIMIT pullbacks, we first check whether
-# price ever returned to the entry (a real fill). If it never did → NF (no-fill).
-# If filled, we then check what came first — TP1 (Win) or the stop (Loss); neither
-# within the window → N. Results feed the daily digest win-rate, fill-rate, and
-# per-strategy stats. Purely observational; never trades.
-
-EVAL_HORIZON_HOURS = 4.0   # how long a signal has to reach TP1 before it's graded
 
 def _parse_ts(s):
     if not s: return None
     try:
-        dt=datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
-def grade_signal(window, side, entry, stop, tp1, atr_window=None):
-    """Replay candles and grade the LIMIT-pullback signal. Returns a dict:
-      outcome:    "W" / "L" / "N" / "NF"  (unchanged classification — same
-                  fill-first-then-stop-vs-tp1 check as before, same conservative
-                  L on a single bar that straddles both levels)
-      mfe_r:      max favorable excursion from entry, in R
-      mae_r:      max adverse   excursion from entry, in R (<= 0)
-      exit_tier:  "STOP" / "TP1_BE" / "TP1_TRAIL" / "OPEN" / "NONE"
-      realized_r: modeled realized R over the 2-tier exit:
-                    -1.0            on STOP
-                    1.0 + 0.5*R_run on TP1 hit (banks 1R, runner is 50%)
-                    0.0             on NONE (never filled — no trade)
-                    None            on OPEN (still running past the eval window)
+# =====================================================================================
+# Indicators / structure primitives
+# =====================================================================================
 
-    2-tier exit model (mirrors the alert's stated plan): after TP1 fills 50% at
-    +2R, 1R is banked and the remaining 50% trails with a Chandelier at
-    TRAIL_ATR_MULT*atr_window from the running high/low since TP1, floored at
-    BE (never worse than entry). If atr_window is unknown (old CSV rows), the
-    runner is assumed to exit at BE — a deliberately conservative fallback."""
-    risk = abs(entry-stop) if (entry is not None and stop is not None) else 0.0
-    sgn  = 1 if side=="long" else -1
-    def r_of(p):
-        return (sgn*(p-entry)/risk) if risk>0 else 0.0
+def ema(series, n): return series.ewm(span=n, adjust=False).mean()
 
-    filled=False
-    mfe_r=0.0; mae_r=0.0
-    tp1_hit_idx=None
-    for i,(_,b) in enumerate(window.iterrows()):
-        hi=float(b["High"]); lo=float(b["Low"])
-        if not filled:
-            if entry is None:
-                filled=True
-            elif side=="long"  and lo<=entry: filled=True
-            elif side=="short" and hi>=entry: filled=True
-            if not filled:
-                continue
-        # entry is filled — track MFE/MAE, then check exits
-        mfe_r=max(mfe_r, r_of(hi if side=="long" else lo))
-        mae_r=min(mae_r, r_of(lo if side=="long" else hi))
-        hit_stop = lo<=stop if side=="long" else hi>=stop
-        hit_tp   = hi>=tp1  if side=="long" else lo<=tp1
-        if hit_stop:
-            return {"outcome":"L","mfe_r":round(mfe_r,3),"mae_r":round(mae_r,3),
-                    "exit_tier":"STOP","realized_r":-1.0}
-        if hit_tp:
-            tp1_hit_idx=i
-            break
-    if not filled:
-        return {"outcome":"NF","mfe_r":0.0,"mae_r":0.0,
-                "exit_tier":"NONE","realized_r":0.0}
-    if tp1_hit_idx is None:
-        return {"outcome":"N","mfe_r":round(mfe_r,3),"mae_r":round(mae_r,3),
-                "exit_tier":"OPEN","realized_r":None}
+def atr(df, n=14):
+    h, l, c = df["High"], df["Low"], df["Close"]
+    pc = c.shift(1)
+    tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    return float(tr.ewm(alpha=1 / n, adjust=False).mean().iloc[-1])
 
-    # TP1 hit — model the runner. Chandelier from the peak since TP1, floored at BE.
-    runner_exit=entry
-    if atr_window and atr_window>0:
-        tp1_bar=window.iloc[tp1_hit_idx]
-        peak=float(tp1_bar["High"] if side=="long" else tp1_bar["Low"])
-        tail=window.iloc[tp1_hit_idx+1:]
-        exited=False
-        for _,b in tail.iterrows():
-            hi=float(b["High"]); lo=float(b["Low"])
-            mfe_r=max(mfe_r, r_of(hi if side=="long" else lo))
-            mae_r=min(mae_r, r_of(lo if side=="long" else hi))
-            if side=="long":
-                peak=max(peak, hi)
-                runner_stop=max(entry, peak - TRAIL_ATR_MULT*atr_window)
-                if lo<=runner_stop:
-                    runner_exit=runner_stop; exited=True; break
-            else:
-                peak=min(peak, lo)
-                runner_stop=min(entry, peak + TRAIL_ATR_MULT*atr_window)
-                if hi>=runner_stop:
-                    runner_exit=runner_stop; exited=True; break
-        if not exited and len(tail)>0:
-            runner_exit=float(window.iloc[-1]["Close"])
-    r_runner=r_of(runner_exit)
-    realized_r=1.0 + 0.5*r_runner
-    exit_tier="TP1_TRAIL" if r_runner>0.05 else "TP1_BE"
-    return {"outcome":"W","mfe_r":round(mfe_r,3),"mae_r":round(mae_r,3),
-            "exit_tier":exit_tier,"realized_r":round(realized_r,3)}
+def swing_points(df, left=SWING_L, right=SWING_R, min_sep=SWING_MIN_SEP):
+    """Return (swing_highs, swing_lows) as lists of (idx, price), oldest-first.
+    A swing high's HIGH is strictly greater than `left` bars before and `right` after
+    (mirror for lows). Accepted swings of the same type are kept >= min_sep apart."""
+    H = df["High"].values; L = df["Low"].values; n = len(df)
+    highs, lows = [], []
+    for i in range(left, n - right):
+        window_h = H[i - left:i + right + 1]
+        window_l = L[i - left:i + right + 1]
+        if H[i] == window_h.max() and (window_h == H[i]).sum() == 1:
+            if not highs or (i - highs[-1][0]) >= min_sep:
+                highs.append((i, float(H[i])))
+        if L[i] == window_l.min() and (window_l == L[i]).sum() == 1:
+            if not lows or (i - lows[-1][0]) >= min_sep:
+                lows.append((i, float(L[i])))
+    return highs, lows
 
-def _rewrite_signals(rows):
+def structure_bias(df, lookback):
+    """Table 4: HH+HL → BULLISH, LH+LL → BEARISH, else NEUTRAL. Needs >=2 of each swing."""
+    seg = df.tail(lookback)
+    highs, lows = swing_points(seg)
+    if len(highs) < 2 or len(lows) < 2:
+        return "NEUTRAL", highs, lows
+    hh = highs[-1][1] > highs[-2][1]; hl = lows[-1][1] > lows[-2][1]
+    lh = highs[-1][1] < highs[-2][1]; ll = lows[-1][1] < lows[-2][1]
+    if hh and hl: return "BULLISH", highs, lows
+    if lh and ll: return "BEARISH", highs, lows
+    return "NEUTRAL", highs, lows
+
+def bos_choch(df, highs, lows, prior_bias):
+    """Detect the most recent BOS / CHOCH on the daily close (spec 3.3).
+    Returns (event, level) where event ∈ {BULLISH_BOS,BEARISH_BOS,BULLISH_CHOCH,
+    BEARISH_CHOCH,None}. CHOCH flips the working bias."""
+    if not highs or not lows: return None, None
+    close = float(df["Close"].iloc[-1])
+    last_sh = highs[-1][1]; last_sl = lows[-1][1]
+    if close > last_sh:
+        return ("BULLISH_CHOCH", last_sh) if prior_bias == "BEARISH" else ("BULLISH_BOS", last_sh)
+    if close < last_sl:
+        return ("BEARISH_CHOCH", last_sl) if prior_bias == "BULLISH" else ("BEARISH_BOS", last_sl)
+    return None, None
+
+# =====================================================================================
+# Layer 1 — Macro Filter (news · DXY · VIX)
+# =====================================================================================
+
+_FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"   # Forex Factory JSON mirror
+
+def _fetch_news():
     try:
-        with open(SIGNALS_CSV,"w",newline="") as f:
-            w=csv.DictWriter(f,fieldnames=CSV_FIELDS,extrasaction="ignore",restval="")
-            w.writeheader()
-            for r in rows: w.writerow(r)
-    except OSError: pass
-
-def evaluate_pending_outcomes(now, use_capital):
-    """Grade any alerted signals older than EVAL_HORIZON_HOURS that have no outcome yet."""
-    if not use_capital or not os.path.exists(SIGNALS_CSV):
-        return
-    _migrate_csv_schema()   # this path rewrites the CSV — never do that on a stale header
-    try:
-        with open(SIGNALS_CSV,"r") as f: rows=list(csv.DictReader(f))
+        r = requests.get(_FF_URL, timeout=_CAP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        out = []
+        for e in r.json():
+            if str(e.get("impact", "")).lower() != "high": continue
+            if str(e.get("country", "")).upper() not in NEWS_IMPACT_CCY: continue
+            try:
+                dt = datetime.fromisoformat(e.get("date"))
+                if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                out.append({"title": str(e.get("title", "event")), "time": dt.astimezone(timezone.utc)})
+            except Exception:
+                pass
+        return out
     except Exception:
-        return
-    pending=[]
-    for r in rows:
-        if r.get("alerted") not in ("A+","WATCH") or r.get("outcome"):
-            continue
-        ts=_parse_ts(r.get("ts_utc"))
-        if ts and (now-ts)>=timedelta(hours=EVAL_HORIZON_HOURS):
-            pending.append(r)
-    if not pending:
-        return
-    price_cache={}; changed=False
-    for r in pending:
-        sym=r.get("symbol")
-        if sym not in CAPITAL_EPICS: continue
-        df=price_cache.get(sym)
-        if df is None:
-            try: df=_cap_fetch(CAPITAL_EPICS[sym],"15m",400)
-            except Exception: df=None
-            price_cache[sym]=df
-        if df is None or len(df)==0: continue
-        ts=_parse_ts(r.get("ts_utc"))
-        try:
-            entry=float(r["entry"]); stop=float(r["stop"]); tp1=float(r["tp1"]); side=r["side"]
-        except (KeyError,ValueError,TypeError):
-            continue
-        # atr15 is optional — old CSV rows won't have it. When absent, grade_signal
-        # falls back to the conservative "runner exits at BE" model.
-        try:
-            atrw=float(r.get("atr15") or "")
-            if not atrw>0: atrw=None
-        except (ValueError,TypeError):
-            atrw=None
-        window=df[(df.index>ts)&(df.index<=ts+timedelta(hours=EVAL_HORIZON_HOURS))]
-        if len(window)==0: continue
-        res=grade_signal(window,side,entry,stop,tp1,atr_window=atrw)
-        r["outcome"]   = res["outcome"]
-        r["mfe_r"]     = res["mfe_r"]
-        r["mae_r"]     = res["mae_r"]
-        r["exit_tier"] = res["exit_tier"]
-        r["realized_r"]= "" if res["realized_r"] is None else res["realized_r"]
-        changed=True
-    if changed:
-        graded=sum(1 for r in pending if r.get("outcome"))
-        _rewrite_signals(rows)
-        log(f"Outcome tracking: graded {graded} past signal(s).")
+        return None   # unreachable → treat as no block (fail-open, logged by caller)
 
-# =====================================================================================
-# Data layer
-# =====================================================================================
-
-def fetch(symbol,interval,period):
-    for attempt in range(3):
-        try:
-            df=yf.Ticker(symbol).history(period=period,interval=interval,auto_adjust=False)
-            if df is not None and len(df)>0:
-                df=df[["Open","High","Low","Close"]].dropna()
-                if df.index.tz is None: df.index=df.index.tz_localize("UTC")
-                else: df.index=df.index.tz_convert("UTC")
-                return df
-        except Exception as e:
-            log(f"fetch {symbol} {interval} #{attempt+1}: {e}")
-        time.sleep(6*(attempt+1))
+def news_block(now, cached_events):
+    """Return the event title if a HIGH-impact USD/EUR/GBP event is within ±60m."""
+    for e in (cached_events or []):
+        if abs((now - e["time"]).total_seconds()) <= NEWS_WINDOW_MIN * 60:
+            return e["title"]
     return None
 
-def closed_bars(df,bar_min,now):
-    if df is None or len(df)==0: return df
-    if (now-df.index[-1])<timedelta(minutes=bar_min): return df.iloc[:-1]
-    return df
+def dxy_bias(dxy_daily):
+    """Table 2: DXY 20-EMA + last-3-close direction → BULLISH_USD / BEARISH_USD / NEUTRAL."""
+    if dxy_daily is None or len(dxy_daily) < DXY_EMA + 3:
+        return "NEUTRAL"
+    e = float(ema(dxy_daily["Close"], DXY_EMA).iloc[-1])
+    px = float(dxy_daily["Close"].iloc[-1])
+    c = dxy_daily["Close"].values
+    asc  = c[-1] > c[-2] > c[-3]
+    desc = c[-1] < c[-2] < c[-3]
+    if abs(px - e) / e <= DXY_NEUTRAL_PCT: return "NEUTRAL"
+    if px > e and asc:  return "BULLISH_USD"
+    if px < e and desc: return "BEARISH_USD"
+    return "NEUTRAL"
+
+def vix_action(vix_value):
+    """Table 3 → (lot_modifier, halt_bool, label)."""
+    if vix_value is None:            return 1.0, False, "n/a"
+    if vix_value > VIX_HALT:         return 0.0, True,  f"{vix_value:.1f} HALT"
+    if vix_value > VIX_HIGH:         return 0.5, False, f"{vix_value:.1f} high"
+    if vix_value >= VIX_CAUTION:     return 0.75, False, f"{vix_value:.1f} caution"
+    return 1.0, False, f"{vix_value:.1f} normal"
+
+def macro_filter(now, state, use_capital):
+    """Layer 1. Cached per session (6h) with on-demand refresh. Returns a dict:
+    {news_block, dxy, vix, vix_mod, vix_halt, vix_label}."""
+    ts = _parse_ts(state.get("macro_ts"))
+    if state.get("macro") and ts and (now - ts) < timedelta(hours=6):
+        return state["macro"]
+
+    events = _fetch_news()
+    if events is None:
+        log("News feed unreachable — proceeding without a news block (fail-open).")
+        events = []
+
+    dxy = "NEUTRAL"; vix_val = None
+    if use_capital:
+        try:
+            d = _cap_fetch(DXY_EPIC, "1d", 40)
+            dxy = dxy_bias(d)
+        except Exception:
+            log(f"DXY ({DXY_EPIC}) unavailable — DXY bias = NEUTRAL.")
+        try:
+            v = _cap_fetch(VIX_EPIC, "1d", 5)
+            if v is not None and len(v): vix_val = float(v["Close"].iloc[-1])
+        except Exception:
+            log(f"VIX ({VIX_EPIC}) unavailable — VIX filter disabled.")
+
+    vix_mod, vix_halt, vix_label = vix_action(vix_val)
+    macro = {
+        "news_events": [{"title": e["title"], "time": e["time"].isoformat()} for e in events],
+        "dxy": dxy, "vix": vix_val, "vix_mod": vix_mod,
+        "vix_halt": vix_halt, "vix_label": vix_label,
+    }
+    state["macro"] = macro; state["macro_ts"] = now.isoformat()
+    return macro
+
+def _news_events_from_macro(macro):
+    out = []
+    for e in macro.get("news_events", []):
+        t = _parse_ts(e.get("time"))
+        if t: out.append({"title": e["title"], "time": t})
+    return out
 
 # =====================================================================================
-# Indicators (Smart Trading Framework: RSI, MACD, EMA)
+# Layer 2 — HTF bias (Weekly → Daily, BOS/CHOCH)
 # =====================================================================================
 
-def atr(df,n=14):
-    h,l,c=df["High"],df["Low"],df["Close"]
-    pc=c.shift(1)
-    tr=pd.concat([(h-l),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
-    return float(tr.ewm(alpha=1/n,adjust=False).mean().iloc[-1])
+def htf_bias(weekly, daily):
+    """Combine weekly + daily structure (Table 5). Returns a dict with the resolved
+    bias, the tradable side, a confidence penalty, and the stored BOS/CHOCH level."""
+    wbias, _, _ = structure_bias(weekly, WEEKLY_LOOKBACK)
+    dbias, dh, dl = structure_bias(daily, DAILY_LOOKBACK)
+    event, level = bos_choch(daily, dh, dl, dbias)
+    # CHOCH flips the working daily bias to the new direction.
+    if event == "BULLISH_CHOCH": dbias = "BULLISH"
+    elif event == "BEARISH_CHOCH": dbias = "BEARISH"
 
-def adx(df,n=14):
-    """Average Directional Index — trend strength. <20 = choppy, >25 = trending."""
-    h,l,c=df["High"],df["Low"],df["Close"]
-    up=h.diff(); dn=-l.diff()
-    pdm=up.where((up>dn)&(up>0),0.0); ndm=dn.where((dn>up)&(dn>0),0.0)
-    pc=c.shift(1)
-    tr=pd.concat([(h-l),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
-    atr_s=tr.ewm(alpha=1/n,adjust=False).mean()
-    pdi=100*(pdm.ewm(alpha=1/n,adjust=False).mean()/atr_s)
-    ndi=100*(ndm.ewm(alpha=1/n,adjust=False).mean()/atr_s)
-    dx=100*((pdi-ndi).abs()/(pdi+ndi))
-    return float(dx.ewm(alpha=1/n,adjust=False).mean().iloc[-1])
-
-def rsi(df,n=14):
-    delta=df["Close"].diff()
-    gain=delta.where(delta>0,0.0).ewm(alpha=1/n,adjust=False).mean()
-    loss=(-delta.where(delta<0,0.0)).ewm(alpha=1/n,adjust=False).mean()
-    rs=gain/loss
-    return 100-(100/(1+rs))
-
-def macd_hist(df):
-    e12=df["Close"].ewm(span=12,adjust=False).mean()
-    e26=df["Close"].ewm(span=26,adjust=False).mean()
-    sig=(e12-e26).ewm(span=9,adjust=False).mean()
-    return e12-e26-sig  # histogram
-
-def ema(series,n):
-    return series.ewm(span=n,adjust=False).mean()
-
-def pivots(df,k=3):
-    highs,lows=[],[]
-    H,L=df["High"].values,df["Low"].values
-    for i in range(k,len(df)-k):
-        if H[i]>=H[i-k:i+k+1].max(): highs.append((i,float(H[i])))
-        if L[i]<=L[i-k:i+k+1].min(): lows.append((i,float(L[i])))
-    return highs,lows
-
-def htf_bias(d1):
-    """Use actual Daily chart with EMA-50/200 (matches Trading Bot Strategy
-    regime filter and Smart Trading Framework 'Daily defines direction')."""
-    if d1 is None or len(d1)<210: return "neutral"
-    e50=d1["Close"].ewm(span=50,adjust=False).mean()
-    e200=d1["Close"].ewm(span=200,adjust=False).mean()
-    close=float(d1["Close"].iloc[-1])
-    slope50=float(e50.iloc[-1]-e50.iloc[-5])
-    if close>e50.iloc[-1] and e50.iloc[-1]>e200.iloc[-1] and slope50>0: return "bull"
-    if close<e50.iloc[-1] and e50.iloc[-1]<e200.iloc[-1] and slope50<0: return "bear"
-    return "neutral"
-
-def is_volatile(m15c,threshold=0.018):
-    """Trading Bot Strategy Gate 2 — ATR/close > 1.8% = VOLATILE, skip."""
-    a=atr(m15c.tail(120),14)
-    c=float(m15c["Close"].iloc[-1])
-    return (a/c)>threshold if c>0 else False
-
-def is_choppy(m15c):
-    """Smart Trading Framework 'When NOT to Trade' — choppy / no structure.
-    ADX < 18 on M15 = no tradeable trend."""
-    if len(m15c)<30: return False
-    return adx(m15c.tail(60),14)<18
-
+    penalty = 0; result = "NO_BIAS"; side = None
+    if wbias == "BULLISH" and dbias == "BULLISH": result, side = "STRONG_BULL", "long"
+    elif wbias == "BEARISH" and dbias == "BEARISH": result, side = "STRONG_BEAR", "short"
+    elif wbias == "BULLISH" and dbias == "NEUTRAL": result, side, penalty = "WEAK_BULL", "long", 1
+    elif wbias == "BEARISH" and dbias == "NEUTRAL": result, side, penalty = "WEAK_BEAR", "short", 1
+    elif {wbias, dbias} == {"BULLISH", "BEARISH"}: result = "CONFLICT"
+    return {"weekly": wbias, "daily": dbias, "result": result, "side": side,
+            "penalty": penalty, "event": event, "level": level}
 
 # =====================================================================================
-# Indicator confirmation score (Smart Trading Framework: RSI + MACD + EMA = 1 factor)
+# Layer 3 — Liquidity mapping (4H)
 # =====================================================================================
 
-def indicator_score(m15c, side):
-    """RSI checks DIRECTION (falling/rising) not just level.
-    Smart Trading Framework: 'RSI falling' for bearish, 'RSI rising' for bullish.
-    Returns (points 0-10, reasons list, aligned_count 0-3). `aligned_count` is the
-    raw number of the three indicators pointing the trade's way — FIX 5 uses it as a
-    pass/fail gate (>=2) instead of adding the points."""
-    pts=0; reasons=[]
-    r_series=rsi(m15c,14)
-    r=float(r_series.iloc[-1]); r_prev=float(r_series.iloc[-3])
-    h=macd_hist(m15c); h_now=float(h.iloc[-1]); h_prev=float(h.iloc[-2])
-    e20=float(ema(m15c["Close"],20).iloc[-1]); c=float(m15c["Close"].iloc[-1])
-    if side=="short":
-        if r<r_prev: pts+=1  # RSI FALLING (not just level)
-        if h_now<h_prev: pts+=1  # MACD histogram falling
-        if c<e20: pts+=1  # price below EMA20
-    else:
-        if r>r_prev: pts+=1  # RSI RISING
-        if h_now>h_prev: pts+=1  # MACD histogram rising
-        if c>e20: pts+=1  # price above EMA20
-    if pts>=2:
-        score=10; reasons.append(f"indicators aligned ({pts}/3: RSI {'↓' if side=='short' else '↑'} {r:.0f}, MACD {'↓' if side=='short' else '↑'}, {'<' if side=='short' else '>'}EMA20)")
-    elif pts==1:
-        score=4; reasons.append(f"weak indicator conf ({pts}/3)")
-    else:
-        score=0
-    return score, reasons, pts
+def _group_levels(points, tol=EQUAL_LEVEL_TOL):
+    """Cluster swing points whose prices are within tol of each other. Returns
+    [{level, touches, priority}] with priority by touch count (spec 4.1)."""
+    pools = []
+    for _, price in points:
+        placed = False
+        for pool in pools:
+            if abs(price - pool["level"]) / pool["level"] <= tol:
+                pool["level"] = (pool["level"] * pool["touches"] + price) / (pool["touches"] + 1)
+                pool["touches"] += 1; placed = True; break
+        if not placed:
+            pools.append({"level": price, "touches": 1})
+    for p in pools:
+        p["priority"] = "HIGH" if p["touches"] >= 3 else "MEDIUM" if p["touches"] == 2 else "LOW"
+    return pools
+
+def liquidity_map(df4h):
+    """Layer 3. BSL (above, from swing highs) and SSL (below, from swing lows) over the
+    last LIQ_LOOKBACK_4H candles. Marks each pool SWEPT if a later candle traded through
+    it; the nearest UNMITIGATED pool each side is the directional draw (spec 4.3)."""
+    seg = df4h.tail(LIQ_LOOKBACK_4H)
+    highs, lows = swing_points(seg)
+    bsl = _group_levels(highs); ssl = _group_levels(lows)
+    hi = seg["High"].values; lo = seg["Low"].values
+
+    def _swept(level, side):
+        # side "bsl": swept if any subsequent HIGH exceeded it; "ssl": any LOW below it.
+        arr = hi if side == "bsl" else lo
+        return bool((arr > level).any()) if side == "bsl" else bool((arr < level).any())
+
+    # Determine "swept" using the bar AFTER the level formed: approximate by whole-seg
+    # extreme beyond the level (a level equal to the running extreme is unmitigated).
+    seg_hi = float(seg["High"].max()); seg_lo = float(seg["Low"].min())
+    for p in bsl: p["status"] = "UNMITIGATED" if p["level"] >= seg_hi - 1e-9 else "SWEPT"
+    for p in ssl: p["status"] = "UNMITIGATED" if p["level"] <= seg_lo + 1e-9 else "SWEPT"
+    return {"bsl": bsl, "ssl": ssl}
+
+def nearest_pools(liq, price):
+    """Nearest UNMITIGATED BSL above and SSL below the current price."""
+    above = [p for p in liq["bsl"] if p["status"] == "UNMITIGATED" and p["level"] > price]
+    below = [p for p in liq["ssl"] if p["status"] == "UNMITIGATED" and p["level"] < price]
+    nb = min(above, key=lambda p: p["level"] - price) if above else None
+    ns = max(below, key=lambda p: p["level"] - price) if below else None
+    return nb, ns
+
+def major_daily_target(liq, side):
+    """Highest-priority pool in the trade direction — TP2 reference (spec 7.2)."""
+    pools = liq["bsl"] if side == "long" else liq["ssl"]
+    if not pools: return None
+    rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    return max(pools, key=lambda p: (rank[p["priority"]], p["touches"]))["level"]
 
 # =====================================================================================
-# Entry-confirmation gates (bot_entry_gates — adapted to this bot's data model)
-# =====================================================================================
-# Ported from the standalone bot_entry_gates spec. Adapted: this bot's frames use
-# capitalized OHLC columns and carry a monotonic UTC DatetimeIndex (candle order is
-# already guaranteed by _cap_fetch's sort — so the spec's "Fix 0" order guard is not
-# repeated here). ATR reuses this file's atr(); the H1 impulse reuses ema().
-
-def _confirms_rejection(candle, side, min_wick_ratio, close_zone):
-    """True if `candle` (an M15 row) is a pin-bar rejecting in the trade's favor."""
-    o=float(candle["Open"]); h=float(candle["High"]); l=float(candle["Low"]); c=float(candle["Close"])
-    rng=max(h-l,1e-9); body=max(abs(c-o),1e-9)
-    lower_wick=min(o,c)-l; upper_wick=h-max(o,c)
-    if side=="long":
-        return bool(lower_wick>=min_wick_ratio*body and c>=l+close_zone*rng)
-    return bool(upper_wick>=min_wick_ratio*body and c<=h-close_zone*rng)
-
-def _opposing_impulse(h1c, side, ema_fast=20, ema_slow=50, slope_lookback=3):
-    """True if the H1 EMA20/50 has FLIPPED against the trade (block), as opposed to a
-    normal pullback (allow). Returns False (don't block) when H1 history is too short."""
-    if h1c is None or len(h1c)<=ema_slow+slope_lookback:
-        return False
-    ef=ema(h1c["Close"],ema_fast); es=ema(h1c["Close"],ema_slow)
-    es_slope=float(es.iloc[-1]-es.iloc[-1-slope_lookback])
-    if side=="long":
-        return bool(ef.iloc[-1]<es.iloc[-1] and es_slope<0)
-    return bool(ef.iloc[-1]>es.iloc[-1] and es_slope>0)
-
-def entry_gates_result(side, m15c, h1c, atr15, cfd):
-    """Run all three entry gates. Returns (passed: bool, reasons: list[str]).
-    Gate #3's 'leg' is the recent M15 swing over GATE_LEG_LOOKBACK bars — a
-    strategy-agnostic proxy for how extended the current move already is."""
-    cfg=GATE_CFG.get(cfd,GATE_CFG["US500"])
-    reasons=[]
-    if not _confirms_rejection(m15c.iloc[-1],side,cfg["min_wick_ratio"],cfg["close_zone"]):
-        reasons.append("no_rejection_candle")
-    if _opposing_impulse(h1c,side):
-        reasons.append("opposing_h1_impulse")
-    seg=m15c.tail(GATE_LEG_LOOKBACK)
-    swing=float(seg["High"].max())-float(seg["Low"].min())
-    ext=(swing/atr15) if atr15 and atr15>0 else 0.0
-    if ext>cfg["max_leg_ext"]:
-        reasons.append(f"leg_too_extended_{ext:.1f}atr")
-    return (len(reasons)==0, reasons)
-
-# =====================================================================================
-# Liquidity levels (fractal — shared across strategies)
+# Layer 4 — POI detection & scoring (4H)
 # =====================================================================================
 
-def build_levels(d1,m15,now):
-    buy_side,sell_side=[],[]
-    today=now.date()
-    dd=d1[[d.date()<today for d in d1.index]] if d1 is not None and len(d1) else None
-    if dd is not None and len(dd)>=1:
-        buy_side.append(("prev-day high",float(dd["High"].iloc[-1]),10))
-        sell_side.append(("prev-day low",float(dd["Low"].iloc[-1]),10))
-        cur_yw=now.isocalendar()[:2]; weeks={}
-        for ts,row in dd.iterrows():
-            yw=ts.isocalendar()[:2]
-            if yw==cur_yw: continue
-            hi,lo=weeks.get(yw,(-math.inf,math.inf))
-            weeks[yw]=(max(hi,float(row["High"])),min(lo,float(row["Low"])))
-        if weeks:
-            lw=sorted(weeks.keys())[-1]
-            buy_side.append(("prior-week high",weeks[lw][0],13))
-            sell_side.append(("prior-week low",weeks[lw][1],13))
-        pm_y,pm_m=(now.year,now.month-1) if now.month>1 else (now.year-1,12)
-        pm=dd[[(t.year==pm_y and t.month==pm_m) for t in dd.index]]
-        if len(pm):
-            buy_side.append(("prior-month high",float(pm["High"].max()),15))
-            sell_side.append(("prior-month low",float(pm["Low"].min()),15))
-    if m15 is not None and len(m15):
-        asia=m15[(m15.index.date==today)&(m15.index.hour<7)]
-        if len(asia)>=4:
-            buy_side.append(("Asia high",float(asia["High"].max()),6))
-            sell_side.append(("Asia low",float(asia["Low"].min()),6))
-        recent=m15.tail(96)
-        if len(recent)>20:
-            ph,pl=pivots(recent.iloc[:-4],k=3)
-            px=float(recent["Close"].iloc[-1]); tol=0.0007*px
-            for arr,out,label in ((ph,buy_side,"equal highs"),(pl,sell_side,"equal lows")):
-                vals=sorted(v for _,v in arr); i=0
-                while i<len(vals):
-                    g=[vals[i]]; j=i+1
-                    while j<len(vals) and vals[j]-g[0]<=tol: g.append(vals[j]); j+=1
-                    if len(g)>=2:
-                        lv=max(g) if out is buy_side else min(g)
-                        out.append((label,float(lv),7))
-                    i=j
-    def dedup(levels):
-        levels=sorted(levels,key=lambda x:-x[2]); kept=[]
-        for n,p,w in levels:
-            if any(abs(p-kp)<=0.0006*p for _,kp,_ in kept): continue
-            kept.append((n,p,w))
-        return kept
-    return dedup(buy_side),dedup(sell_side)
-
-# =====================================================================================
-# STRATEGY 1: Supply Zone / Order Block Rejection
-# =====================================================================================
-
-def detect_zone_rejection(name,cfg,m15c,h1c,atr15,side):
-    """Find H1 order blocks, check if M15 price is rejecting one."""
-    if h1c is None or len(h1c)<30: return []
-    candidates=[]
-    a1h=atr(h1c.tail(60),14)
-    close=float(m15c["Close"].iloc[-1])
-    last=m15c.iloc[-1]
-    body=abs(float(last["Open"])-float(last["Close"]))
-
-    for i in range(5,len(h1c)-1):
-        bar=h1c.iloc[i]
-        bdy=abs(float(bar["Open"])-float(bar["Close"]))
-        if bdy<1.2*a1h: continue  # need strong candle
-        if side=="short" and float(bar["Close"])<float(bar["Open"]):
-            # bearish OB: last up-candle before this drop = zone
-            if i>0:
-                prev=h1c.iloc[i-1]
-                if float(prev["Close"])>=float(prev["Open"]):
-                    zone_top=float(prev["High"]); zone_bot=float(prev["Open"])
-                    if zone_bot<=close<=zone_top:
-                        # check for rejection: bearish candle with upper wick
-                        wick_up=float(last["High"])-max(float(last["Open"]),float(last["Close"]))
-                        if body>0.3*atr15 and float(last["Close"])<float(last["Open"]):
-                            candidates.append({
-                                "strategy":"zone-rejection","side":"short",
-                                "entry":close,"stop":zone_top+STOP_BUFFER_ATR*atr15,
-                                "level_name":"H1 supply zone","level_price":zone_top,
-                                "base_score":37,"pattern_bonus": min(8,int(wick_up/atr15*8)),
-                                "reasons":[f"rejected H1 supply zone {zone_bot:.0f}-{zone_top:.0f}"]
-                            })
-        elif side=="long" and float(bar["Close"])>float(bar["Open"]):
-            if i>0:
-                prev=h1c.iloc[i-1]
-                if float(prev["Close"])<=float(prev["Open"]):
-                    zone_bot=float(prev["Low"]); zone_top=float(prev["Close"])
-                    if zone_bot<=close<=zone_top:
-                        wick_dn=min(float(last["Open"]),float(last["Close"]))-float(last["Low"])
-                        if body>0.3*atr15 and float(last["Close"])>float(last["Open"]):
-                            candidates.append({
-                                "strategy":"zone-rejection","side":"long",
-                                "entry":close,"stop":zone_bot-STOP_BUFFER_ATR*atr15,
-                                "level_name":"H1 demand zone","level_price":zone_bot,
-                                "base_score":37,"pattern_bonus":min(8,int(wick_dn/atr15*8)),
-                                "reasons":[f"rejected H1 demand zone {zone_bot:.0f}-{zone_top:.0f}"]
-                            })
-    # keep only the freshest (closest zone)
-    if candidates:
-        candidates.sort(key=lambda x:abs(close-x["level_price"]))
-        return [candidates[0]]
-    return []
-
-# =====================================================================================
-# STRATEGY 2: Liquidity Sweep + BOS (from v2 — the original core)
-# =====================================================================================
-
-def detect_sweep(name,cfg,m15c,atr15,side,levels_same):
-    close=float(m15c["Close"].iloc[-1])
-    win=m15c.iloc[-SWEEP_LOOKBACK:]
-    last=m15c.iloc[-1]
-    sgn=-1 if side=="short" else 1
-
-    best=None
-    for lname,L,w in levels_same:
-        if side=="short":
-            swept=float(win["High"].max())>L+0.02*atr15 and close<L
-            extreme=float(win["High"].max()); overshoot=extreme-L; extension=L-close
+def find_order_block(df, side):
+    """Last opposite-colour candle before a >=IMPULSE_MIN-candle impulse in `side`'s
+    direction. OB zone = that candle's full high–low body (spec table 7)."""
+    o = df["Open"].values; c = df["Close"].values
+    h = df["High"].values; l = df["Low"].values
+    n = len(df)
+    for i in range(n - IMPULSE_MIN - 1, 0, -1):
+        if side == "long":
+            impulse = all(c[i + k] > o[i + k] for k in range(1, IMPULSE_MIN + 1)) and \
+                      c[i + IMPULSE_MIN] > h[i]
+            if impulse and c[i] < o[i]:   # last down candle before the up-move
+                return {"top": float(h[i]), "bottom": float(l[i]), "idx": i}
         else:
-            swept=float(win["Low"].min())<L-0.02*atr15 and close>L
-            extreme=float(win["Low"].min()); overshoot=L-extreme; extension=close-L
-        if not swept: continue
-        if overshoot>MAX_SWEEP_OVERSHOOT_ATR*atr15: continue
-        if extension>MAX_EXTENSION_ATR*atr15: continue
-        if best is None or w>best[2]: best=(lname,L,w,extreme)
-    if best is None: return []
-    lname,L,lweight,extreme=best
+            impulse = all(c[i + k] < o[i + k] for k in range(1, IMPULSE_MIN + 1)) and \
+                      c[i + IMPULSE_MIN] < l[i]
+            if impulse and c[i] > o[i]:   # last up candle before the down-move
+                return {"top": float(h[i]), "bottom": float(l[i]), "idx": i}
+    return None
 
-    body=float(last["Open"]-last["Close"])*sgn*-1
-    rng=float(last["High"]-last["Low"])
-    displacement=(body>0) and (body>=0.5*atr15 or (rng>=1.0*atr15 and body>=0.5*rng))
-    look=m15c.iloc[-22:-1]; ph,pl=pivots(look,k=2)
-    if side=="short": bos=bool(pl) and close<pl[-1][1]
-    else: bos=bool(ph) and close>ph[-1][1]
-    if not (displacement or bos): return []
+def find_fvg(df, side, start=None, end=None):
+    """3-candle Fair Value Gap (spec table 7 / 6.3). Bullish: gap between candle-1 HIGH
+    and candle-3 LOW; bearish: between candle-1 LOW and candle-3 HIGH. Scans the given
+    slice most-recent-first and returns {top, bottom, mid, idx}."""
+    h = df["High"].values; l = df["Low"].values
+    n = len(df)
+    lo_i = 2 if start is None else max(2, start)
+    hi_i = n if end is None else min(n, end)
+    for i in range(hi_i - 1, lo_i - 1, -1):   # i = candle-3 index
+        c1_h, c1_l = h[i - 2], l[i - 2]
+        c3_h, c3_l = h[i], l[i]
+        if side == "long" and c3_l > c1_h:    # bullish gap
+            top, bottom = float(c3_l), float(c1_h)
+            return {"top": top, "bottom": bottom, "mid": bottom + (top - bottom) * 0.5, "idx": i}
+        if side == "short" and c3_h < c1_l:   # bearish gap
+            top, bottom = float(c1_l), float(c3_h)
+            return {"top": top, "bottom": bottom, "mid": top - (top - bottom) * 0.5, "idx": i}
+    return None
 
-    pb=0
-    if displacement and bos: pb=8
-    elif displacement: pb=5
-    else: pb=3
-    # check wick
-    for _,b in win.iterrows():
-        if side=="short" and float(b["High"])>L and float(b["Close"])<L: pb+=2; break
-        if side=="long" and float(b["Low"])<L and float(b["Close"])>L: pb+=2; break
+def _overlap_pct(a_top, a_bot, b_top, b_bot):
+    inter = max(0.0, min(a_top, b_top) - max(a_bot, b_bot))
+    span = max(a_top, b_top) - min(a_bot, b_bot)
+    return inter / span if span > 0 else 0.0
 
-    entry=0.5*(extreme+close)
-    return [{
-        "strategy":"liquidity-sweep","side":side,
-        "entry":entry,"stop":extreme,"extreme":extreme,
-        "level_name":lname,"level_price":L,"level_weight":lweight,
-        "base_score":38,"pattern_bonus":min(10,pb),
-        # FIX 3: expose whether a candle-close BOS actually printed. Detection is
-        # still generous (displacement OR bos), but the tier assignment in
-        # run_cycle caps sweeps without a real BOS at WATCH — heads-up only.
-        "bos_confirmed": bool(bos),
-        "reasons":[f"swept {lname} {L:.2f}",
-                   "displacement+BOS" if (displacement and bos) else ("displacement" if displacement else "BOS")]
-    }]
+def fib_band(df4h, side):
+    """0.50–0.705 retracement band of the last major 4H impulse (swing low→high for a
+    long, high→low for a short)."""
+    seg = df4h.tail(LIQ_LOOKBACK_4H)
+    highs, lows = swing_points(seg)
+    if not highs or not lows: return None
+    sh = highs[-1][1]; sl = lows[-1][1]
+    if sh <= sl: return None
+    if side == "long":
+        return (sh - (sh - sl) * FIB_HIGH, sh - (sh - sl) * FIB_LOW)   # (low_price, high_price)
+    return (sl + (sh - sl) * FIB_LOW, sl + (sh - sl) * FIB_HIGH)
 
-# =====================================================================================
-# STRATEGY 3: Double Top / Double Bottom
-# =====================================================================================
-
-def detect_double_pattern(name,cfg,m15c,atr15,side):
-    """Strategy 3: Double Top/Bottom AND Head & Shoulders."""
-    if len(m15c)<60: return []
-    close=float(m15c["Close"].iloc[-1])
-    recent=m15c.tail(80)
-    ph,pl=pivots(recent,k=3)
-    results=[]
-
-    if side=="short":
-        # --- Double Top ---
-        if len(ph)>=2:
-            for i in range(len(ph)-1):
-                for j in range(i+1,len(ph)):
-                    idx_i,p_i=ph[i]; idx_j,p_j=ph[j]
-                    if abs(idx_j-idx_i)<8: continue
-                    if abs(p_i-p_j)>0.003*max(p_i,p_j): continue
-                    seg=recent.iloc[idx_i:idx_j+1]
-                    neckline=float(seg["Low"].min())
-                    if close<neckline:
-                        pat_height=max(p_i,p_j)-neckline
-                        results.append({"strategy":"double-top","side":"short",
-                            "entry":close,"stop":max(p_i,p_j)+STOP_BUFFER_ATR*atr15,
-                            "level_name":"double-top neckline","level_price":neckline,
-                            "pat_height":pat_height,
-                            "base_score":35,"pattern_bonus":min(8,int(pat_height/atr15*3)),
-                            "reasons":[f"double top at {max(p_i,p_j):.2f}, neckline {neckline:.2f} broken"]})
-                        break
-                if results: break
-
-        # --- Head & Shoulders ---
-        if len(ph)>=3 and not results:
-            for i in range(len(ph)-2):
-                idx_l,p_l=ph[i]       # left shoulder
-                idx_h,p_h=ph[i+1]     # head (must be highest)
-                idx_r,p_r=ph[i+2]     # right shoulder
-                if not (p_h>p_l and p_h>p_r): continue  # head must be highest
-                if abs(p_l-p_r)>0.005*p_h: continue     # shoulders roughly equal
-                if idx_h-idx_l<5 or idx_r-idx_h<5: continue
-                seg=recent.iloc[idx_l:idx_r+1]
-                neckline=float(seg["Low"].min())
-                if close<neckline:
-                    pat_height=p_h-neckline
-                    results.append({"strategy":"head-shoulders","side":"short",
-                        "entry":close,"stop":p_r+STOP_BUFFER_ATR*atr15,
-                        "level_name":"H&S neckline","level_price":neckline,
-                        "pat_height":pat_height,
-                        "base_score":37,"pattern_bonus":min(10,int(pat_height/atr15*3)),
-                        "reasons":[f"H&S: head {p_h:.2f}, shoulders {p_l:.2f}/{p_r:.2f}, neckline {neckline:.2f} broken"]})
-                    break
-
-    elif side=="long":
-        # --- Double Bottom ---
-        if len(pl)>=2:
-            for i in range(len(pl)-1):
-                for j in range(i+1,len(pl)):
-                    idx_i,p_i=pl[i]; idx_j,p_j=pl[j]
-                    if abs(idx_j-idx_i)<8: continue
-                    if abs(p_i-p_j)>0.003*max(p_i,p_j): continue
-                    seg=recent.iloc[idx_i:idx_j+1]
-                    neckline=float(seg["High"].max())
-                    if close>neckline:
-                        pat_height=neckline-min(p_i,p_j)
-                        results.append({"strategy":"double-bottom","side":"long",
-                            "entry":close,"stop":min(p_i,p_j)-STOP_BUFFER_ATR*atr15,
-                            "level_name":"double-bottom neckline","level_price":neckline,
-                            "pat_height":pat_height,
-                            "base_score":35,"pattern_bonus":min(8,int(pat_height/atr15*3)),
-                            "reasons":[f"double bottom at {min(p_i,p_j):.2f}, neckline {neckline:.2f} broken"]})
-                        break
-                if results: break
-
-        # --- Inverse Head & Shoulders ---
-        if len(pl)>=3 and not results:
-            for i in range(len(pl)-2):
-                idx_l,p_l=pl[i]; idx_h,p_h=pl[i+1]; idx_r,p_r=pl[i+2]
-                if not (p_h<p_l and p_h<p_r): continue
-                if abs(p_l-p_r)>0.005*max(p_l,p_r): continue
-                if idx_h-idx_l<5 or idx_r-idx_h<5: continue
-                seg=recent.iloc[idx_l:idx_r+1]
-                neckline=float(seg["High"].max())
-                if close>neckline:
-                    pat_height=neckline-p_h
-                    results.append({"strategy":"inv-head-shoulders","side":"long",
-                        "entry":close,"stop":p_r-STOP_BUFFER_ATR*atr15,
-                        "level_name":"inv H&S neckline","level_price":neckline,
-                        "pat_height":pat_height,
-                        "base_score":37,"pattern_bonus":min(10,int(pat_height/atr15*3)),
-                        "reasons":[f"inv H&S: head {p_h:.2f}, shoulders {p_l:.2f}/{p_r:.2f}, neckline {neckline:.2f} broken"]})
-                    break
-
-    return results[:1]  # best pattern only
+def score_poi(df4h, side, ob, fvg, liq, price):
+    """Table 8 confluence scoring. Daily-bias alignment is REQUIRED upstream (this POI is
+    only built for the biased side). Returns (score, grade, factors)."""
+    score = 0.0; factors = []
+    if ob:
+        score += 1.0; factors.append("OB")
+    if ob and fvg and _overlap_pct(ob["top"], ob["bottom"], fvg["top"], fvg["bottom"]) >= 0.30:
+        score += 1.0; factors.append("FVG")
+    band = fib_band(df4h, side)
+    poi_level = ob["mid"] if ob and "mid" in ob else (
+        (ob["top"] + ob["bottom"]) / 2 if ob else price)
+    if band and band[0] <= poi_level <= band[1]:
+        score += 1.0; factors.append("Fib")
+    # Untouched: price hasn't reacted inside the OB body since it formed.
+    if ob:
+        after = df4h.iloc[ob["idx"] + 1:]
+        touched = ((after["Low"] <= ob["top"]) & (after["High"] >= ob["bottom"])).any() if len(after) else False
+        if not touched:
+            score += 0.5; factors.append("Untouched")
+    # Near a HIGH-priority pool.
+    pools = liq["bsl"] + liq["ssl"]
+    if any(p["priority"] == "HIGH" and abs(poi_level - p["level"]) / poi_level <= LIQ_NEAR_PCT for p in pools):
+        score += 0.5; factors.append("NearLiq")
+    grade = "A+" if score >= 3.0 else "A" if score >= 2.0 else "B" if score >= 1.0 else "C"
+    return round(score, 1), grade, factors
 
 # =====================================================================================
-# STRATEGY 4: Bear Flag / Bull Flag
+# Layer 5 — LTF entry (15M sweep → 15M CHOCH → 5M FVG)
 # =====================================================================================
 
-def detect_flag(name,cfg,m15c,atr15,side):
-    if len(m15c)<40: return []
-    close=float(m15c["Close"].iloc[-1])
-    # look for pole (sharp move) then flag (shallow consolidation)
-    for pole_end in range(len(m15c)-15, len(m15c)-8):
-        if pole_end<5: continue
-        # pole = 3-8 bars before pole_end
-        for pole_start in range(max(0,pole_end-8), pole_end-2):
-            seg=m15c.iloc[pole_start:pole_end+1]
-            if side=="short":
-                pole_move=float(seg["High"].max()-seg["Close"].iloc[-1])
-            else:
-                pole_move=float(seg["Close"].iloc[-1]-seg["Low"].min())
-            if pole_move<2.0*atr15: continue  # pole must be strong
+def detect_ltf_sequence(df15, df5, side, poi, ssl_level, bsl_level):
+    """Reconstruct Sweep → CHOCH → FVG over recent candles. Returns a dict with the
+    entry price + trigger flags, or None if the sequence is incomplete/expired.
+    All three steps must fall within the POI zone / cadence limits (spec 6)."""
+    h = df15["High"].values; l = df15["Low"].values; c = df15["Close"].values
+    n = len(df15)
+    ptop, pbot = poi["top"], poi["bottom"]
 
-            # flag = bars after pole_end until now-1
-            flag=m15c.iloc[pole_end+1:-1]
-            if len(flag)<3: continue
-            flag_range=float(flag["High"].max()-flag["Low"].min())
-            if flag_range>0.5*pole_move: continue  # flag must be tight
-
-            # check for breakout of flag
-            if side=="short" and close<float(flag["Low"].min()):
-                pole_target=close-pole_move
-                return [{"strategy":"bear-flag","side":"short",
-                         "entry":close,"stop":float(flag["High"].max())+STOP_BUFFER_ATR*atr15,
-                         "level_name":"flag low","level_price":float(flag["Low"].min()),
-                         "base_score":36,"pattern_bonus":min(8,int(pole_move/atr15*2)),
-                         "pole_target":pole_target,
-                         "reasons":[f"bear flag: pole {pole_move:.1f}pts, flag broke at {float(flag['Low'].min()):.2f}"]}]
-            elif side=="long" and close>float(flag["High"].max()):
-                pole_target=close+pole_move
-                return [{"strategy":"bull-flag","side":"long",
-                         "entry":close,"stop":float(flag["Low"].min())-STOP_BUFFER_ATR*atr15,
-                         "level_name":"flag high","level_price":float(flag["High"].max()),
-                         "base_score":36,"pattern_bonus":min(8,int(pole_move/atr15*2)),
-                         "pole_target":pole_target,
-                         "reasons":[f"bull flag: pole {pole_move:.1f}pts, flag broke at {float(flag['High'].max()):.2f}"]}]
-    return []
-
-# =====================================================================================
-# STRATEGY 5: Post-News Momentum Retest
-# =====================================================================================
-
-def detect_news_retest(name,cfg,m15c,atr15,side,now):
-    """After a news event, check if a big move happened and price is retesting.
-    Triggers after a fixed blackout window OR a real high-impact USD event."""
-    econ_evt=recent_econ_event(now, minutes=45)
-    if not recently_exited_blackout(now, minutes=45) and not econ_evt: return []
-    if len(m15c)<10: return []
-    evt_tag=f" after {econ_evt}" if econ_evt else ""
-    close=float(m15c["Close"].iloc[-1])
-
-    # find the largest candle in the last 6 bars (the news bar)
-    recent=m15c.iloc[-6:]
-    ranges=[(float(b["High"]-b["Low"]),i) for i,(_,b) in enumerate(recent.iterrows())]
-    max_rng,max_idx=max(ranges,key=lambda x:x[0])
-    if max_rng<1.5*atr15: return []  # no significant news move
-
-    news_bar=recent.iloc[max_idx]
-    if side=="short" and float(news_bar["Close"])<float(news_bar["Open"]):
-        # bearish news move — retest of the broken level (the news bar's open area)
-        retest_level=float(news_bar["Open"])
-        if abs(close-retest_level)<0.5*atr15:
-            return [{"strategy":"news-retest","side":"short",
-                     "entry":close,"stop":retest_level+0.5*atr15,
-                     "level_name":"post-news retest","level_price":retest_level,
-                     "base_score":34,"pattern_bonus":min(8,int(max_rng/atr15*3)),
-                     "reasons":[f"post-news bearish move{evt_tag} ({max_rng:.1f}pts), retesting {retest_level:.2f}"]}]
-    elif side=="long" and float(news_bar["Close"])>float(news_bar["Open"]):
-        retest_level=float(news_bar["Open"])
-        if abs(close-retest_level)<0.5*atr15:
-            return [{"strategy":"news-retest","side":"long",
-                     "entry":close,"stop":retest_level-0.5*atr15,
-                     "level_name":"post-news retest","level_price":retest_level,
-                     "base_score":34,"pattern_bonus":min(8,int(max_rng/atr15*3)),
-                     "reasons":[f"post-news bullish move{evt_tag} ({max_rng:.1f}pts), retesting {retest_level:.2f}"]}]
-    return []
-
-# =====================================================================================
-# Fibonacci retracement confluence
-# =====================================================================================
-# Measure the most recent swing (high↔low over FIB_LOOKBACK M15 bars) and check
-# whether the setup's level sits on a key retracement. The 0.5–0.618 "golden zone"
-# is where institutional pullbacks most often reverse, so it earns more points.
-
-FIB_LOOKBACK = 60
-FIB_LEVELS   = [0.382, 0.5, 0.618, 0.786]
-
-def fib_confluence(m15c, atr15, price, lookback=FIB_LOOKBACK):
-    """Return (points, reason) if `price` sits near a key Fibonacci level."""
-    if m15c is None or len(m15c) < lookback or atr15 <= 0:
-        return 0, None
-    seg=m15c.tail(lookback)
-    hi=float(seg["High"].max()); lo=float(seg["Low"].min())
-    rng=hi-lo
-    if rng <= 0:
-        return 0, None
-    tol=0.35*atr15
-    best=None; best_dist=None
-    for f in FIB_LEVELS:
-        lv=hi-f*rng                     # retracement level from the swing high
-        d=abs(price-lv)
-        if best_dist is None or d<best_dist:
-            best_dist=d; best=f; best_lv=lv
-    if best_dist is not None and best_dist<=tol:
-        pts=8 if best in (0.5, 0.618) else 5   # golden zone worth more
-        return pts, f"at fib {best*100:.1f}% ({best_lv:.2f})"
-    return 0, None
-
-# =====================================================================================
-# Unified confluence scoring (Smart Trading Framework)
-# =====================================================================================
-
-def score_candidate(raw, cfg, symbol_name, m15c, atr15, atr1h, bias, now, flat_by, levels_opp):
-    """Add confluence factors to a raw candidate from any strategy detector."""
-    side=raw["side"]; sgn=-1 if side=="short" else 1
-    score=float(raw["base_score"])+float(raw.get("pattern_bonus",0))
-    reasons=list(raw["reasons"])
-
-    # ---- Smart Trading Framework: 3 confirmation factors ----------------------------
-
-    # Factor 1: Indicator confirmation (RSI + MACD + EMA)
-    ind_pts, ind_reasons, ind_aligned = indicator_score(m15c, side)
-    score += ind_pts; reasons += ind_reasons
-
-    # Factor 2: Multi-timeframe alignment
-    if (side=="short" and bias=="bear") or (side=="long" and bias=="bull"):
-        htf_live=15; reasons.append(f"HTF bias {bias} aligned")
-    elif bias=="neutral": htf_live=5
-    else: htf_live=-8; reasons.append(f"counter-trend vs HTF {bias} (-8)")
-    score+=htf_live
-
-    # FIX 5 (observe-only unless SCORE_MODEL_V2): recompute the score with the
-    # HTF-aligned bonus reduced 15->10 and the indicator points removed (indicator
-    # becomes a >=2/3 gate instead). Everything else added below applies to both,
-    # so deriving score_v2 as a delta keeps them in lockstep.
-    htf_v2 = 10 if htf_live==15 else htf_live      # only the +15 case changes
-    gate_v2_pass = ind_aligned>=2
-    v2_delta = (htf_v2-htf_live) - ind_pts          # swap HTF, drop indicator points
-
-    # Factor 3: Session timing (per-instrument weights)
-    hr=now.hour+now.minute/60.0
-    sb=cfg.get("session_bonus",{"london":6,"ny":10})
-    if 12.5<=hr<16.0: score+=sb["ny"]; reasons.append("NY session")
-    elif 7.0<=hr<12.5: score+=sb["london"]; reasons.append("London session")
-    elif 0.0<=hr<7.0: score+=2; reasons.append("Asia session")
-
-    # ---- Additional confluence (not part of the 3-factor count) ---------------------
-    step=cfg["round_step"]; L=raw["level_price"]
-    nearest_round=round(L/step)*step
-    if abs(L-nearest_round)<=0.3*atr15:
-        score+=5; reasons.append(f"round number {nearest_round:.0f}")
-
-    # Fibonacci retracement confluence (golden zone 0.5–0.618 rewarded more)
-    fib_pts,fib_reason=fib_confluence(m15c,atr15,L)
-    if fib_pts:
-        score+=fib_pts; reasons.append(fib_reason)
-
-    # ---- Finalize entry / stop / risk / targets -------------------------------------
-    entry=raw["entry"]; stop_raw=raw["stop"]
-
-    # stop randomization (exit-strategies)
-    rand_off=random.uniform(STOP_RAND_MIN,STOP_RAND_MAX)*atr15 if STOP_RANDOMIZE else 0
-    if side=="short": stop=stop_raw+rand_off
-    else: stop=stop_raw-rand_off
-
-    # for sweep strategy, use retrace entry
-    if raw["strategy"]=="liquidity-sweep":
-        extreme=raw.get("extreme",stop_raw)
-        entry=0.5*(extreme+float(m15c["Close"].iloc[-1]))
-        sl_max=cfg.get("atr_sl_max",STOP_ATR_MULT_MAX)
-        if side=="short":
-            stop=extreme+STOP_BUFFER_ATR*atr15+rand_off
-            entry=max(entry,stop-0.95*sl_max*atr15)
-        else:
-            stop=extreme-STOP_BUFFER_ATR*atr15-rand_off
-            entry=min(entry,stop+0.95*sl_max*atr15)
-
-    sl_max=cfg.get("atr_sl_max",STOP_ATR_MULT_MAX)
-    sl_min=cfg.get("atr_sl_min",STOP_ATR_MULT_MIN)
-
-    # ---- Momentum-adaptive entry (improve fill rate in trends) ----------------------
-    # A deep limit rarely fills in a strong trend — price just runs (the "correct
-    # direction but never entered" problem). Measure trend strength (ADX); when
-    # strong, pull the entry toward current price so it is actually reachable, capped
-    # so risk never exceeds the per-instrument ATR stop limit. Calm markets keep the
-    # deeper, better-priced entry unchanged.
-    close_now=float(m15c["Close"].iloc[-1])
-    trend_adx=adx(m15c.tail(60),14) if len(m15c)>=60 else 0.0
-    pullback=(close_now-entry) if side=="long" else (entry-close_now)
-    if trend_adx>=20 and pullback>0:
-        shrink=0.45 if trend_adx>=25 else 0.70
-        entry=close_now-sgn*pullback*shrink
-        if abs(stop-entry)>sl_max*atr15:          # cap: never exceed ATR stop limit
-            entry=stop+sgn*sl_max*atr15
-        reasons.append(f"entry tightened (ADX {trend_adx:.0f} trend)")
-
-    # ---- Hard reachability cap (always on) ------------------------------------------
-    # Guarantee the limit is fillable in ANY regime: it must never sit more than
-    # MAX_ENTRY_PULLBACK_ATR × ATR away from the current price. This is the core fix
-    # for "correct direction but the entry was never touched" — still a pullback
-    # (we don't chase), but always within normal intraday reach.
-    max_pull=MAX_ENTRY_PULLBACK_ATR*atr15
-    pullback=(close_now-entry) if side=="long" else (entry-close_now)
-    if pullback>max_pull:
-        entry=close_now-sgn*max_pull
-        if abs(stop-entry)>sl_max*atr15:          # keep within the ATR stop limit
-            entry=stop+sgn*sl_max*atr15
-        reasons.append(f"entry capped to {MAX_ENTRY_PULLBACK_ATR:.1f}x ATR of price")
-
-    risk=abs(stop-entry)
-    if risk<=0 or risk>sl_max*atr15 or risk<sl_min*atr15:
+    # --- Step 1: 15M liquidity sweep, inside the POI zone, in the last ~10 candles ---
+    sweep_i = None
+    for i in range(n - 1, max(-1, n - 12), -1):
+        in_zone = pbot <= c[i] <= ptop
+        if side == "long" and ssl_level is not None:
+            if l[i] < ssl_level and c[i] > ssl_level and in_zone: sweep_i = i; break
+        if side == "short" and bsl_level is not None:
+            if h[i] > bsl_level and c[i] < bsl_level and in_zone: sweep_i = i; break
+    if sweep_i is None:
         return None
 
-    tp1=entry+sgn*TP1_RR*risk
-    # runner
-    runner,runner_rr=None,0.0
-    opp=[p for _,p,_ in levels_opp if (p<entry if side=="short" else p>entry)]
-    if opp:
-        runner=max(opp) if side=="short" else min(opp)
-        runner_rr=abs(entry-runner)/risk
-    # flag strategies use pole-projection target
-    if "pole_target" in raw:
-        tp2=raw["pole_target"]
-    elif runner and runner_rr>=2.5:
-        tp2=runner
+    # --- Step 2: 15M CHOCH within CHOCH_MAX_CANDLES of the sweep (spec 6.2) ---
+    # After the sweep, a swing forms in the trade direction; the CHOCH is the candle
+    # that CLOSES beyond the last such swing high/low formed after the sweep. We track
+    # the running post-sweep extreme (seeded by the sweep candle) and fire when a close
+    # breaks it. The breaking candle's high/low becomes the Structure Reference Point.
+    choch = False; srp = None
+    ref = h[sweep_i] if side == "long" else l[sweep_i]
+    end = min(n, sweep_i + 1 + CHOCH_MAX_CANDLES)
+    for j in range(sweep_i + 1, end):
+        if side == "long":
+            if c[j] > ref: choch = True; srp = float(h[j]); break
+            ref = max(ref, h[j])
+        else:
+            if c[j] < ref: choch = True; srp = float(l[j]); break
+            ref = min(ref, l[j])
+    if not choch:
+        return None
+
+    # --- Step 3: 5M FVG in the CHOCH impulse; entry at its 50% ---
+    fvg = find_fvg(df5, side, start=max(2, len(df5) - 12))
+    if fvg is None:
+        return None
+    price_now = float(df5["Close"].iloc[-1])
+    # FVG must not be fully filled already, and price must still be able to retrace in.
+    if side == "long" and price_now < fvg["bottom"]:
+        return None
+    if side == "short" and price_now > fvg["top"]:
+        return None
+    return {"sweep_idx": sweep_i, "srp": srp, "fvg": fvg, "entry": fvg["mid"],
+            "sweep": True, "choch": True, "fvg_ok": True}
+
+# =====================================================================================
+# Layer 6 — Risk (SL / TP / RR / sizing)
+# =====================================================================================
+
+def build_risk(side, entry, ob, fvg, liq, price, pip, pip_value, vix_mod):
+    """SL beyond the OB body (or FVG if OB-less), TP1 = nearest liquidity draw,
+    TP2 = major daily liquidity. Validates RR (spec 7). Returns a dict or None."""
+    buf = SL_BUFFER_PIPS * pip
+    if ob:
+        stop = ob["bottom"] - buf if side == "long" else ob["top"] + buf
     else:
-        tp2=entry+sgn*TP2_RR*risk
+        stop = fvg["bottom"] - buf if side == "long" else fvg["top"] + buf
 
-    # ---- FIX 4: pattern-specific target (observe-only unless PATTERN_TARGETS_ENABLED) --
-    # Reversal patterns -> measured move projected from the neckline (level_price).
-    # Zone-rejection -> nearest opposing liquidity (the runner). Logged always; only
-    # replaces the live TP2 when the flag is on AND it sits beyond TP1 in-direction.
-    pat_tp2=None
-    if raw["strategy"] in ("double-top","double-bottom","head-shoulders","inv-head-shoulders") \
-       and raw.get("pat_height"):
-        pat_tp2=raw["level_price"]+sgn*abs(float(raw["pat_height"]))
-    elif raw["strategy"]=="zone-rejection" and runner is not None:
-        pat_tp2=runner
-    pat_tp2_r=(abs(pat_tp2-entry)/risk) if pat_tp2 is not None else None
-    if PATTERN_TARGETS_ENABLED and pat_tp2 is not None and sgn*(pat_tp2-tp1)>0:
-        tp2=pat_tp2
+    # TP1 = nearest unmitigated pool in the DIRECTION of travel (BSL above for a long,
+    # SSL below for a short). TP2 = the major daily liquidity target.
+    nb, ns = nearest_pools(liq, price)
+    tp1 = (nb["level"] if nb else None) if side == "long" else (ns["level"] if ns else None)
+    tp2 = major_daily_target(liq, side)
 
-    # ---- FIX 5: finalize score under the active model --------------------------------
-    score_v2=score+v2_delta
-    if SCORE_MODEL_V2:
-        score=score_v2
+    if tp1 is None or tp2 is None:
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    rr1 = abs(tp1 - entry) / risk
+    rr2 = abs(tp2 - entry) / risk
+    if rr1 < RR_TP1_MIN or rr2 < RR_TP2_MIN:
+        return None
 
-    # pace check
-    hours_avail=min(MAX_HOLD_HOURS,max(0,(flat_by-now).total_seconds()/3600))
-    reachable=0.5*atr1h*hours_avail
-    if TP1_RR*risk>PACE_SAFETY*reachable: return None
-
-    time_stop_at=min(now+timedelta(hours=TIME_STOP_HOURS),flat_by)
-    score=min(100.0,score)
-    return {
-        "symbol":symbol_name,"side":side,"score":round(score,1),
-        "strategy":raw["strategy"],
-        "entry":entry,"stop":stop,"tp1":tp1,"tp2":tp2,
-        "be_stop":entry,"risk_pts":risk,
-        "runner":runner,"runner_rr":round(runner_rr,2),
-        "trail_desc":f"Chandelier {TRAIL_ATR_MULT}x ATR",
-        "time_stop_desc":f"If flat after {fmt_both(time_stop_at)}, close",
-        "level_name":raw["level_name"],"level_price":raw["level_price"],"atr15":atr15,
-        "reasons":reasons,"flat_by":flat_by,
-        "key":f"{symbol_name}:{side}:{raw['strategy']}:{round(raw['level_price'],1)}",
-        # Non-sweep strategies always pass the BOS gate; sweep sets it explicitly.
-        "bos_confirmed": raw.get("bos_confirmed", True),
-        # FIX 4/5 observation fields (logged; gate_v2 also enforced when flag on).
-        "tp2_pattern":  round(pat_tp2,2) if pat_tp2 is not None else "",
-        "tp2_pattern_r":round(pat_tp2_r,3) if pat_tp2_r is not None else "",
-        "score_v2":     round(min(100.0,score_v2),1),
-        "gate_v2_pass": gate_v2_pass,
-    }
+    sl_pips = risk / pip
+    risk_amount = ACCOUNT_BALANCE * RISK_PCT * (vix_mod if vix_mod > 0 else 1.0)
+    lot = round(risk_amount / (sl_pips * pip_value), 2) if sl_pips > 0 and pip_value > 0 else 0.0
+    return {"stop": stop, "tp1": tp1, "tp2": tp2, "rr1": round(rr1, 2), "rr2": round(rr2, 2),
+            "sl_pips": round(sl_pips, 1), "lot": lot, "risk_amount": round(risk_amount, 2)}
 
 # =====================================================================================
-# Position sizing + alert text
+# Layer 7 — Checklist gate (10 conditions, 5 critical, >= 8/10)
 # =====================================================================================
 
-def size_line(cfg,risk_pts):
-    risk_dollars=ACCOUNT_SIZE*RISK_PCT/100.0
-    risk_per_lot=risk_pts*cfg["per_lot_per_pt"]
-    if risk_per_lot<=0: return "Size: error."
-    exact=risk_dollars/risk_per_lot
-    lots=(exact//LOT_STEP)*LOT_STEP if LOT_STEP>0 else 0
-    lots=round(lots,4)
-    if lots>=MIN_LOT_SIZE:
-        return f"Size @{RISK_PCT:.0f}% of ${ACCOUNT_SIZE:,.0f}: {lots:.2f} lot {cfg['cfd']} (risk ${lots*risk_per_lot:,.0f})"
-    return (f"Size: 0 lots {cfg['cfd']} — 1 lot risks ${risk_per_lot:,.0f} > ${risk_dollars:,.0f} budget. "
-            f"SKIP or set MIN_LOT_SIZE=0.01.")
-
-STRAT_LABELS={
-    "liquidity-sweep":"Strategy 2: Liquidity Sweep + BOS",
-    "zone-rejection":"Strategy 1: Supply Zone Rejection",
-    "double-top":"Strategy 3: Double Top",
-    "double-bottom":"Strategy 3: Double Bottom",
-    "head-shoulders":"Strategy 3: Head & Shoulders",
-    "inv-head-shoulders":"Strategy 3: Inverse Head & Shoulders",
-    "bear-flag":"Strategy 4: Bear Flag",
-    "bull-flag":"Strategy 4: Bull Flag",
-    "news-retest":"Strategy 5: Post-News Retest",
-}
-
-def alert_text(c,cfg,tier,now,st):
-    arrow="SHORT" if c["side"]=="short" else "LONG"
-    head="A+ SETUP" if tier=="A+" else "WATCH (heads-up only)"
-    hold_to=min(now+timedelta(hours=MAX_HOLD_HOURS),c["flat_by"])
-    # Optional "aggressive" entry, halfway to price — for momentum days when price
-    # won't pull all the way back to the limit. Same stop, so smaller reward:risk.
-    agg=c["entry"]+(0.5*c["atr15"] if c["side"]=="long" else -0.5*c["atr15"])
-    lines=[
-        f"[{head}] {arrow} {c['symbol']} ({cfg['cfd']}) — score {c['score']:.0f}/100",
-        STRAT_LABELS.get(c["strategy"],c["strategy"]),
-        "",
-        f"Entry  {c['entry']:.2f}  (LIMIT pullback — never chase)",
-        f"  alt aggressive entry {agg:.2f} (optional, if no pullback — smaller R:R)",
-        f"Stop   {c['stop']:.2f}  ({c['risk_pts']:.2f}pts = {c['risk_pts']/c['atr15']:.1f}x ATR15)",
-        "",
-        "EXIT PLAN:",
-        f"  TP1  {c['tp1']:.2f}  (50%, move stop to BE {c['be_stop']:.2f})",
-        f"  TP2  {c['tp2']:.2f}  (trail: {c['trail_desc']})",
-        f"  Time: {c['time_stop_desc']}",
-        "",
-        size_line(cfg,c["risk_pts"]),
-        f"FLAT BY {fmt_both(hold_to)}",
-        "",
-        "Why: "+"; ".join(c["reasons"]),
+def checklist(instr, side, macro, bias, poi_grade, risk, seq):
+    """Returns (passed, score, critical_ok, items). Items 1–5 critical (all must pass);
+    total >= 8/10 to send, 7/10 → alert-only note (spec section 8 / table 13)."""
+    dxy_ok = True
+    if INSTRUMENTS[instr]["dxy_filter"]:
+        dxy_ok = (side == "long" and macro["dxy"] != "BULLISH_USD") or \
+                 (side == "short" and macro["dxy"] != "BEARISH_USD")
+    critical = [
+        ("no_news",        macro.get("news_hit") is None),
+        ("dxy_aligned",    dxy_ok),
+        ("daily_bias",     (side == "long" and bias["daily"] == "BULLISH") or
+                           (side == "short" and bias["daily"] == "BEARISH")),
+        ("poi_grade",      poi_grade in PROCEED_GRADES),
+        ("rr_ok",          risk is not None and risk["rr2"] >= RR_TP2_MIN),
     ]
-    lines+=["","Survival > Capital > Growth","Outcome auto-tracked from the chart"]
-    return "\n".join(lines)
+    standard = [
+        ("weekly_bias",    (side == "long" and bias["weekly"] == "BULLISH") or
+                           (side == "short" and bias["weekly"] == "BEARISH")),
+        ("sweep",          bool(seq and seq.get("sweep"))),
+        ("choch",          bool(seq and seq.get("choch"))),
+        ("fvg",            bool(seq and seq.get("fvg_ok"))),
+        ("vix_ok",         not macro.get("vix_halt")),
+    ]
+    critical_ok = all(v for _, v in critical)
+    score = sum(1 for _, v in critical if v) + sum(1 for _, v in standard if v)
+    passed = critical_ok and score >= 8
+    return passed, score, critical_ok, critical + standard
 
 # =====================================================================================
-# Status JSON — pushed to 'status' branch after every scan cycle
+# Signal logging + Telegram alert
+# =====================================================================================
+
+CSV_FIELDS = ["ts_utc", "instrument", "direction", "grade", "poi_score", "score",
+              "entry", "stop", "tp1", "tp2", "rr1", "rr2", "sl_pips", "lot",
+              "weekly_bias", "daily_bias", "dxy", "vix", "poi_factors",
+              "sweep", "choch", "fvg", "checklist", "fingerprint"]
+
+def log_signal(row):
+    new = not os.path.exists(SIGNALS_CSV)
+    try:
+        with open(SIGNALS_CSV, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            if new: w.writeheader()
+            w.writerow(row)
+    except Exception:
+        pass
+
+def alert_text(instr, side, sig):
+    poi_desc = " + ".join(sig["poi_factors"]) if sig["poi_factors"] else "OB only"
+    exp = (now_utc() + timedelta(minutes=FVG_RETRACE_MAX * 5))
+    return (
+        f"🔔 NEW SIGNAL — {instr}\n"
+        f"Direction : {'LONG' if side == 'long' else 'SHORT'}\n"
+        f"Grade     : {sig['grade']}\n"
+        f"Score     : {sig['score']}/10\n"
+        f"Entry     : {sig['entry']:.2f}\n"
+        f"SL        : {sig['risk']['stop']:.2f}  ({sig['risk']['sl_pips']:.0f} pips)\n"
+        f"TP1       : {sig['risk']['tp1']:.2f}  (RR {sig['risk']['rr1']:.1f}:1)\n"
+        f"TP2       : {sig['risk']['tp2']:.2f}  (RR {sig['risk']['rr2']:.1f}:1)\n"
+        f"Lot Size  : {sig['risk']['lot']:.2f}\n"
+        f"Bias      : {sig['bias']['weekly']} + {sig['bias']['daily']}\n"
+        f"POI       : {poi_desc}\n"
+        f"Trigger   : Sweep ✓ | CHOCH ✓ | FVG entry ✓\n"
+        f"DXY       : {sig['macro']['dxy']}\n"
+        f"VIX       : {sig['macro']['vix_label']}\n"
+        f"⏰ Order expires ~{fmt_both(exp)} (8×5M)\n"
+        f"[ALERT_ONLY — no order placed]"
+    )
+
+# =====================================================================================
+# Per-instrument scan (Layers 1→7)
+# =====================================================================================
+
+def scan_instrument(instr, cfg, now, macro, state):
+    """Run the full pipeline for one instrument. Returns a signal dict to alert, or None.
+    Logs the layer reached on abort."""
+    epic = cfg["epic"]
+    try:
+        weekly = _cap_fetch(epic, "1w", WEEKLY_LOOKBACK + 10)
+        daily  = _cap_fetch(epic, "1d", DAILY_LOOKBACK + 10)
+        df4h   = _cap_fetch(epic, "4h", LIQ_LOOKBACK_4H + 10)
+        df15   = _cap_fetch(epic, "15m", 60)
+        df5    = _cap_fetch(epic, "5m", 60)
+    except Exception as e:
+        log(f"{instr}: data fetch error: {e}"); return None
+    if any(x is None or len(x) < 6 for x in (weekly, daily, df4h, df15, df5)):
+        log(f"{instr}: insufficient candles"); return None
+
+    price = float(df5["Close"].iloc[-1])
+
+    # Layer 2 — HTF bias
+    bias = htf_bias(weekly, daily)
+    if bias["side"] is None:
+        log(f"{instr}: L2 bias {bias['result']} — skip"); return None
+    side = bias["side"]
+
+    # Layer 1 detail that depends on side — DXY veto for XAUUSD (critical item 2)
+    macro_local = dict(macro)
+    macro_local["news_hit"] = news_block(now, _news_events_from_macro(macro))
+
+    # Layer 3 — liquidity
+    liq = liquidity_map(df4h)
+    nb, ns = nearest_pools(liq, price)
+
+    # Layer 4 — POI detection + scoring on 4H, on the biased side
+    ob  = find_order_block(df4h, side)
+    fvg4 = find_fvg(df4h, side)
+    if ob is None and fvg4 is None:
+        log(f"{instr}: L4 no POI"); return None
+    poi_zone = ob if ob else fvg4
+    poi_score, grade, factors = score_poi(df4h, side, ob, fvg4, liq, price)
+    if grade not in PROCEED_GRADES:
+        log(f"{instr}: L4 POI grade {grade} ({poi_score}) — no entry"); return None
+
+    # Price must be within POI_NEAR_PCT of the POI zone to arm Layer 5
+    zmid = (poi_zone["top"] + poi_zone["bottom"]) / 2
+    if abs(price - zmid) / zmid > POI_NEAR_PCT:
+        log(f"{instr}: L5 price not at POI ({grade}) — waiting"); return None
+
+    # Layer 5 — LTF entry sequence
+    seq = detect_ltf_sequence(df15, df5, side, poi_zone,
+                              ns["level"] if ns else None,
+                              nb["level"] if nb else None)
+    if seq is None:
+        log(f"{instr}: L5 sequence incomplete"); return None
+    entry = seq["entry"]
+
+    # Layer 6 — risk
+    risk = build_risk(side, entry, ob, seq["fvg"], liq, price,
+                      cfg["pip"], cfg["pip_value"], macro_local.get("vix_mod", 1.0))
+    if risk is None:
+        log(f"{instr}: L6 RR/target validation failed"); return None
+
+    # Layer 7 — checklist gate
+    passed, score, critical_ok, items = checklist(instr, side, macro_local, bias, grade, risk, seq)
+    if not passed:
+        log(f"{instr}: L7 checklist {score}/10 critical_ok={critical_ok} — abort"); return None
+
+    return {"instrument": instr, "side": side, "entry": entry, "grade": grade,
+            "poi_score": poi_score, "poi_factors": factors, "score": score,
+            "risk": risk, "bias": bias, "macro": macro_local, "seq": seq,
+            "checklist": items,
+            "fingerprint": f"{instr}:{side}:{round(zmid, 2)}"}
+
+# =====================================================================================
+# GitHub status push (dashboard) — preserved infra
 # =====================================================================================
 
 STATUS_BRANCH = "status"
 STATUS_FILE   = "bot_status.json"
 
-def read_recent_alerts(n=10):
+def read_recent_signals(n=10):
     rows = []
     try:
         with open(SIGNALS_CSV, "r") as f:
             for row in csv.DictReader(f):
-                if row.get("alerted") in ("A+", "WATCH"):
-                    rows.append({k: row.get(k, "") for k in
-                                 ("ts_utc","symbol","side","score","strategy",
-                                  "entry","tp1","stop","alerted")})
+                rows.append({k: row.get(k, "") for k in
+                             ("ts_utc", "instrument", "direction", "grade", "score",
+                              "entry", "stop", "tp1", "tp2")})
     except Exception:
         pass
     return rows[-n:]
 
-def push_status_json(state, last_scores, now):
-    token = os.getenv("GITHUB_TOKEN")
-    repo  = os.getenv("GITHUB_REPOSITORY")
-    if not token or not repo:
-        return
+def push_status_json(state, now):
+    token = os.getenv("GITHUB_TOKEN"); repo = os.getenv("GITHUB_REPOSITORY")
+    if not token or not repo: return
+    macro = state.get("macro") or {}
     payload = {
         "scanned_at_utc": now.isoformat(timespec="seconds"),
         "market_open": not is_market_closed(now),
-        "today": {
-            "aplus_sent":          state.get("aplus_sent", 0),
-            "watch_sent":          state.get("watch_sent", 0),
-            "evaluated":           state.get("evaluated", 0),
-            "threshold":           state.get("threshold", SCORE_A_PLUS),
-            },
-        "last_scores":   last_scores,
-        "recent_alerts": read_recent_alerts(),
+        "mode": "ALERT_ONLY",
+        "today": {"signals_sent": state.get("signals_sent", 0)},
+        "macro": {"dxy": macro.get("dxy"), "vix": macro.get("vix_label")},
+        "recent_signals": read_recent_signals(),
     }
-    content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
-    url     = f"https://api.github.com/repos/{repo}/contents/{STATUS_FILE}"
+    content = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
+    url = f"https://api.github.com/repos/{repo}/contents/{STATUS_FILE}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     try:
-        r   = requests.get(url, headers=headers, params={"ref": STATUS_BRANCH}, timeout=10)
+        r = requests.get(url, headers=headers, params={"ref": STATUS_BRANCH}, timeout=10)
         sha = r.json().get("sha") if r.ok else None
-        body = {"message": f"status {now.strftime('%H:%M UTC')}", "content": content_b64, "branch": STATUS_BRANCH}
-        if sha:
-            body["sha"] = sha
+        body = {"message": f"status {now.strftime('%H:%M UTC')}", "content": content, "branch": STATUS_BRANCH}
+        if sha: body["sha"] = sha
         requests.put(url, headers=headers, json=body, timeout=10)
     except Exception as e:
         log(f"push_status_json failed (non-critical): {e}")
 
 # =====================================================================================
-# Scan cycle — runs all 5 strategies per instrument
+# Scan cycle
 # =====================================================================================
 
 def run_cycle(loop_mode):
-    now=now_utc()
+    now = now_utc()
     if is_market_closed(now):
         if loop_mode: log(f"Market closed ({now.strftime('%A %H:%M')} UTC).")
         return
-    st=load_state()
-    # Hard flat = 15 min before daily close (21:00 UTC)
-    hard_flat=hhmm_today(now,HARD_FLAT_UTC)
-
-    # Daily digest: fire once between 20:30–21:00 UTC (just before daily close)
-    digest_time=hhmm_today(now,"20:30")
-    digest_cutoff=hhmm_today(now,"21:00")
-    if digest_time<=now<digest_cutoff and not st.get("digest_sent"):
-        best=st.get("best_today")
-        L=[]
-        L.append("📊 DAILY SUMMARY")
-        L.append("")
-        L.append(f"Today the bot sent {st.get('aplus_sent',0)} strong (A+) and "
-                 f"{st.get('watch_sent',0)} watch alerts.")
-        L.append(f"It checked {st.get('evaluated',0)} possible setups.")
-        if best:
-            L.append(f"Best setup seen: {best['symbol']} {best['side'].upper()} "
-                     f"({friendly_strategy(best['strategy'])}), score {best['score']:.0f}/100.")
-
-        today_signals=todays_signal_details(now)
-        if today_signals:
-            L.append("")
-            L.append("── Today's setups, one by one (graded automatically — no trading needed) ──")
-            for s in today_signals:
-                L.append(f"• {s['symbol']} {s['side']} {s['strategy']} → {s['label']}")
-
-        bd=outcome_breakdown(30)
-        if bd.get("total"):
-            L.append("")
-            L.append(f"── What happened to the last {bd['total']} alerts ──")
-            L.append(f"✅ Took profit (hit target): {bd['W']}")
-            L.append(f"❌ Hit the stop (loss): {bd['L']}")
-            L.append(f"↩️ Price never reached entry: {bd['NF']}")
-            if bd['N']:
-                L.append(f"⏳ Entered, still no result yet: {bd['N']}")
-            decided=bd['W']+bd['L']
-            if decided:
-                L.append(f"➡️ Of the {decided} that actually traded, "
-                         f"{bd['W']/decided*100:.0f}% won.")
-
-        sw=strategy_winrates()
-        rr=strategy_realized_r_stats()
-        if sw:
-            L.append("")
-            L.append("By strategy (win rate + realized R, all-time):")
-            for s,(w,tt) in sorted(sw.items(),key=lambda x:-x[1][1]):
-                name=friendly_strategy(s)
-                line=f"• {name}: {w} of {tt} won ({w/tt*100:.0f}%)"
-                if s in rr:
-                    n,mean_r,tot_r=rr[s]
-                    line+=f"  |  realized R: n={n}, mean {mean_r:+.2f}R, total {tot_r:+.2f}R"
-                L.append(line)
-
-        filled,nofill=fill_stats()
-        if filled+nofill>0:
-            L.append("")
-            L.append(f"Entry fill rate (all-time): {filled/(filled+nofill)*100:.0f}% "
-                     f"— {filled} entries reached, {nofill} missed.")
-
-        L.append("")
-        L.append(f"Current alert threshold: {st.get('threshold',SCORE_A_PLUS):.0f}/100.")
-        L.append("A no-trade day is a winning day. 🌱")
-        tg_send("\n".join(L))
-        st["digest_sent"]=True; save_state(st); return
-
-    if in_blackout(now):
-        log("News blackout."); return
-
     use_capital = _ensure_capital()
+    if not use_capital:
+        log("Capital.com unavailable — cannot scan (spec: Capital.com only, no Yahoo)."); return
 
-    # Live economic calendar: pause around real high-impact USD events
-    econ_evt=in_econ_blackout(now)
-    if econ_evt:
-        log(f"Econ blackout: high-impact event '{econ_evt}' within {NEWS_BUFFER_MIN}min."); return
+    state = load_state()
+    macro = macro_filter(now, state, use_capital)
 
-    # Grade past alerts (W/L/N) against later price so the digest shows a real win-rate
-    evaluate_pending_outcomes(now, use_capital)
+    # Global halts (Layer 1): a HIGH-impact event now, or VIX > 35.
+    news_hit = news_block(now, _news_events_from_macro(macro))
+    if news_hit:
+        log(f"NEWS BLOCK — {news_hit} within ±{NEWS_WINDOW_MIN}m."); save_state(state)
+        push_status_json(state, now); return
+    if macro.get("vix_halt"):
+        log(f"VIX HALT — {macro.get('vix_label')}."); save_state(state)
+        push_status_json(state, now); return
 
-    all_candidates=[]; last_scores={}
-    for name,cfg in SYMBOLS.items():
-        time.sleep(2)
+    for instr, cfg in INSTRUMENTS.items():
+        time.sleep(1)
         try:
-            if use_capital:
-                epic = CAPITAL_EPICS[name]
-                m15 = _cap_fetch(epic, "15m", 400)
-                h1  = _cap_fetch(epic, "1h",  300)
-                d1  = _cap_fetch(epic, "1d",  300)
-            else:
-                m15 = fetch(cfg["yf"], "15m", "10d")
-                h1  = fetch(cfg["yf"], "1h",  "1mo")
-                d1  = fetch(cfg["yf"], "1d",  "2y")
+            sig = scan_instrument(instr, cfg, now, macro, state)
         except Exception as e:
-            log(f"{name}: data fetch error: {e}"); continue
-        if m15 is None or h1 is None or d1 is None: continue
-        m15c=closed_bars(m15,15,now); h1c=closed_bars(h1,60,now)
-        d1c=closed_bars(d1,1440,now)
-        if m15c is None or h1c is None or len(m15c)<60 or len(h1c)<60: continue
-        if (now-m15c.index[-1])>timedelta(minutes=45): continue
-
-        atr15=atr(m15c.tail(120),14); atr1h=atr(h1c.tail(120),14)
-        if atr15<=0 or atr1h<=0: continue
-
-        log(f"{name}: scanning {len(m15c)} M15 bars, close={m15c['Close'].iloc[-1]:.2f}, ATR15={atr15:.2f}")
-
-        # Volatility regime gate (Trading Bot Strategy Gate 2)
-        if is_volatile(m15c):
-            log(f"{name}: VOLATILE regime (ATR/close > 1.8%), skipping.")
+            log(f"{instr}: scan error: {e}"); continue
+        if not sig:
             continue
 
-        # Choppy market detection (Smart Trading Framework 'When NOT to Trade')
-        choppy=is_choppy(m15c)
+        fp = sig["fingerprint"]
+        last = _parse_ts(state["fingerprints"].get(fp))
+        if last and (now - last) < timedelta(hours=DEDUP_HOURS):
+            log(f"{instr}: dedup — {fp} alerted <{DEDUP_HOURS}h ago"); continue
+        if state["per_instrument"].get(instr, 0) >= MAX_PER_INSTR_DAY:
+            log(f"{instr}: daily cap reached ({MAX_PER_INSTR_DAY})"); continue
 
-        bias=htf_bias(d1c)
-        buy_side,sell_side=build_levels(d1c,m15c,now)
+        if tg_send(alert_text(instr, sig["side"], sig)):
+            log(f"SIGNAL {instr} {sig['side']} grade {sig['grade']} score {sig['score']}/10")
+            state["fingerprints"][fp] = now.isoformat()
+            state["per_instrument"][instr] = state["per_instrument"].get(instr, 0) + 1
+            state["signals_sent"] = state.get("signals_sent", 0) + 1
+            log_signal({
+                "ts_utc": now.isoformat(timespec="seconds"), "instrument": instr,
+                "direction": sig["side"], "grade": sig["grade"], "poi_score": sig["poi_score"],
+                "score": sig["score"], "entry": round(sig["entry"], 2),
+                "stop": round(sig["risk"]["stop"], 2), "tp1": round(sig["risk"]["tp1"], 2),
+                "tp2": round(sig["risk"]["tp2"], 2), "rr1": sig["risk"]["rr1"], "rr2": sig["risk"]["rr2"],
+                "sl_pips": sig["risk"]["sl_pips"], "lot": sig["risk"]["lot"],
+                "weekly_bias": sig["bias"]["weekly"], "daily_bias": sig["bias"]["daily"],
+                "dxy": sig["macro"]["dxy"], "vix": sig["macro"]["vix_label"],
+                "poi_factors": "+".join(sig["poi_factors"]),
+                "sweep": True, "choch": True, "fvg": True,
+                "checklist": ";".join(f"{k}={int(v)}" for k, v in sig["checklist"]),
+                "fingerprint": fp,
+            })
 
-        sides=[]
-        if ENABLE_SHORTS: sides.append(("short",buy_side,sell_side))
-        if ENABLE_LONGS: sides.append(("long",sell_side,buy_side))
-
-        for side,same,opp in sides:
-            raws=[]
-            raws+=detect_sweep(name,cfg,m15c,atr15,side,same)
-            raws+=detect_zone_rejection(name,cfg,m15c,h1c,atr15,side)
-            raws+=detect_double_pattern(name,cfg,m15c,atr15,side)
-            raws+=detect_flag(name,cfg,m15c,atr15,side)
-            raws+=detect_news_retest(name,cfg,m15c,atr15,side,now)
-            for raw in raws:
-                c=score_candidate(raw,cfg,name,m15c,atr15,atr1h,bias,now,hard_flat,opp)
-                if c:
-                    # penalize choppy markets (-10 score)
-                    if choppy:
-                        c["score"]=max(0,c["score"]-10)
-                        c["reasons"].append("choppy market (-10)")
-                    # Entry-confirmation gates (observe/live per ENTRY_GATES_MODE)
-                    if ENTRY_GATES_MODE!="off":
-                        gp,gr=entry_gates_result(c["side"],m15c,h1c,atr15,cfg["cfd"])
-                        c["gates_pass"]=gp; c["gates_reasons"]=";".join(gr)
-                    st["evaluated"]=st.get("evaluated",0)+1
-                    all_candidates.append((c,cfg))
-                    # track best score per symbol for status dashboard
-                    prev=last_scores.get(name,{})
-                    if c["score"]>prev.get("score",0):
-                        last_scores[name]={"score":round(c["score"],1),"side":c["side"],"strategy":c["strategy"]}
-
-    # US Index Consensus Filter (Trading Bot Strategy Section 8)
-    # If 2+ US indices fire signals, suppress any that contradict the consensus
-    index_signals=[c for c,cfg in all_candidates if cfg["kind"]=="index" and c["score"]>=SCORE_WATCH]
-    if len(index_signals)>=2:
-        buy_count=sum(1 for c in index_signals if c["side"]=="long")
-        sell_count=sum(1 for c in index_signals if c["side"]=="short")
-        consensus_side="long" if buy_count>sell_count else "short" if sell_count>buy_count else None
-        if consensus_side:
-            before=len(all_candidates)
-            all_candidates=[(c,cfg) for c,cfg in all_candidates
-                            if cfg["kind"]!="index" or c["side"]==consensus_side or c["score"]<SCORE_WATCH]
-            dropped=before-len(all_candidates)
-            if dropped: log(f"Consensus filter: dropped {dropped} index signal(s) contradicting {consensus_side}")
-
-    # Correlation cap: max 1 index alert per cycle (US500/US100/US30 share same tech stocks)
-    idx_qualifying=[(c,cf) for c,cf in all_candidates if cf["kind"]=="index" and c["score"]>=SCORE_WATCH]
-    if len(idx_qualifying)>1:
-        best_idx=max(idx_qualifying,key=lambda x:x[0]["score"])
-        all_candidates=[(c,cf) for c,cf in all_candidates
-                        if cf["kind"]!="index" or c["score"]<SCORE_WATCH or (c,cf)==best_idx]
-        log(f"Correlation cap: kept only top index signal ({best_idx[0]['symbol']} {best_idx[0]['score']:.0f})")
-
-    if not all_candidates:
-        push_status_json(st, last_scores, now)
-        save_state(st); return
-    all_candidates.sort(key=lambda x:-x[0]["score"])
-    threshold=float(st.get("threshold",SCORE_A_PLUS))
-
-    for c,cfg in all_candidates:
-        if st.get("best_today") is None or c["score"]>st["best_today"]["score"]:
-            st["best_today"]={"symbol":c["symbol"],"side":c["side"],"score":c["score"],
-                              "strategy":c["strategy"]}
-        if c["key"] in st.get("sent_keys",[]): continue
-        last_sym=st.get("last_alert_ts",{}).get(c["symbol"])
-        if last_sym and (now-datetime.fromisoformat(last_sym))<timedelta(minutes=COOLDOWN_MIN_PER_SYMBOL): continue
-        last_any=st.get("last_any_alert_ts")
-        if last_any and (now-datetime.fromisoformat(last_any))<timedelta(minutes=MIN_GAP_BETWEEN_ALERTS): continue
-
-        tier=None
-        if c["score"]>=threshold and st.get("aplus_sent",0)<MAX_APLUS_PER_DAY: tier="A+"
-        elif SCORE_WATCH<=c["score"] and st.get("watch_sent",0)<MAX_WATCH_PER_DAY: tier="WATCH"
-        if tier is None: continue
-
-        # FIX 3: liquidity-sweep without a candle-close BOS is heads-up only —
-        # cap at WATCH instead of dropping the alert so it still gets logged.
-        if tier=="A+" and c["strategy"]=="liquidity-sweep" and not c.get("bos_confirmed", True):
-            if st.get("watch_sent",0)<MAX_WATCH_PER_DAY:
-                tier="WATCH"
-                c["reasons"].append("BOS not confirmed → WATCH (needs candle-close BOS for A+)")
-            else:
-                continue
-
-        # FIX 5 gate (only when SCORE_MODEL_V2 is on): <2/3 indicators aligned caps
-        # the tier at WATCH — same detect-generously / grade-strictly shape as FIX 3.
-        if SCORE_MODEL_V2 and tier=="A+" and not c.get("gate_v2_pass", True):
-            if st.get("watch_sent",0)<MAX_WATCH_PER_DAY:
-                tier="WATCH"
-                c["reasons"].append("indicator gate <2/3 → WATCH")
-            else:
-                continue
-
-        # Entry gates (only when ENTRY_GATES_MODE=="live"): failed confirmation caps
-        # A+ -> WATCH. In "observe" mode the result is logged but never changes tier.
-        if ENTRY_GATES_MODE=="live" and tier=="A+" and not c.get("gates_pass", True):
-            if st.get("watch_sent",0)<MAX_WATCH_PER_DAY:
-                tier="WATCH"
-                c["reasons"].append("entry gates failed ("+c.get("gates_reasons","")+") → WATCH")
-            else:
-                continue
-
-        if tg_send(alert_text(c,cfg,tier,now,st)):
-            log(f"ALERT {tier} {c['symbol']} {c['strategy']} {c['side']} score {c['score']}")
-            c["alerted"]=tier
-            st["sent_keys"].append(c["key"])
-            st.setdefault("last_alert_ts",{})[c["symbol"]]=now.isoformat()
-            st["last_any_alert_ts"]=now.isoformat()
-            if tier=="A+":
-                st["aplus_sent"]=st.get("aplus_sent",0)+1
-            else: st["watch_sent"]=st.get("watch_sent",0)+1
-
-    for c,cfg in all_candidates:
-        if c["score"]>=50:
-            log_csv({"ts_utc":now.isoformat(timespec="seconds"),
-                "symbol":c["symbol"],"cfd":cfg["cfd"],"side":c["side"],
-                "strategy":c["strategy"],"score":c["score"],
-                "setup_quality":"A+" if c["score"]>=threshold else "B",
-                "entry":round(c["entry"],2),"stop":round(c["stop"],2),
-                "tp1":round(c["tp1"],2),"tp2":round(c["tp2"],2),
-                "trailing_method":c["trail_desc"],"time_stop":c["time_stop_desc"],
-                "risk_pts":round(c["risk_pts"],2),"level":c["level_name"],
-                "level_price":round(c["level_price"],2),
-                "reasons":" | ".join(c["reasons"]),"alerted":c.get("alerted",""),
-                "outcome":"","exit_price":"","pnl_usd":"","hold_minutes":"","lessons":"",
-                "atr15":round(c["atr15"],4),
-                "mfe_r":"","mae_r":"","exit_tier":"","realized_r":"",
-                "tp2_pattern":c.get("tp2_pattern",""),"tp2_pattern_r":c.get("tp2_pattern_r",""),
-                "score_v2":c.get("score_v2",""),"gate_v2_pass":c.get("gate_v2_pass",""),
-                "gates_pass":c.get("gates_pass",""),"gates_reasons":c.get("gates_reasons","")})
-    push_status_json(st, last_scores, now)
-    save_state(st)
+    save_state(state)
+    push_status_json(state, now)
 
 # =====================================================================================
 # Entry points
 # =====================================================================================
 
 def self_test():
-    log("Self-test v3.0…")
-    ok_tg=tg_send("sweep_alert_agent v3.0 multi-strategy: Telegram OK ✔")
-    df=fetch(SYMBOLS["GOLD"]["yf"],"15m","5d")
-    ok_data=df is not None and len(df)>50
-    log(f"Telegram: {'OK' if ok_tg else 'FAIL'} | Data: {'OK '+str(len(df))+' bars' if ok_data else 'FAIL'}")
-    if ok_tg and ok_data:
-        tg_send("v3.0 ready — 5 strategies:\n"
-                "1. Zone Rejection\n2. Liquidity Sweep\n3. Double Top/Bottom\n"
-                "4. Bear/Bull Flag\n5. Post-News Retest\n"
-                f"Window: Sun 22:00–Fri 21:00 UTC, daily close 21:00–22:00 UTC\n"
-                )
+    log("Self-test — SMC-Macro v1.0")
+    ok_tg = tg_send("SMC-Macro bot v1.0: Telegram OK ✔ (ALERT_ONLY)")
+    ok_cap = _ensure_capital()
+    n = 0
+    if ok_cap:
+        try:
+            d = _cap_fetch(INSTRUMENTS["XAUUSD"]["epic"], "1d", 40)
+            n = len(d) if d is not None else 0
+        except Exception as e:
+            log(f"Capital fetch failed: {e}")
+    log(f"Telegram: {'OK' if ok_tg else 'FAIL'} | Capital: {'OK ' + str(n) + ' daily bars' if n else 'FAIL'}")
+    if ok_tg:
+        tg_send("SMC-Macro v1.0 ready — 7-layer pipeline, 4 instruments, ALERT_ONLY.\n"
+                "Layers: Macro · HTF Bias · Liquidity · POI · LTF Entry · Risk · Checklist")
 
 def main():
-    args=set(a.lower() for a in sys.argv[1:])
-    if "--test" in args: self_test(); return
+    args = set(a.lower() for a in sys.argv[1:])
+    if "--test" in args:
+        self_test(); return
     if "--once" in args:
         try: run_cycle(False)
-        except: log("Crash:\n"+traceback.format_exc())
+        except Exception: log("Crash:\n" + traceback.format_exc())
         return
-    log(f"v3.0 loop: {SCAN_EVERY_MIN}min, 5 strategies, Sun 22:00–Fri 21:00 UTC")
-    tg_send(f"Agent v3.0 online — 5 strategies × {len(SYMBOLS)} instruments\n"
-            f"Every {SCAN_EVERY_MIN}min | max {MAX_APLUS_PER_DAY} A+/day")
+    log(f"SMC-Macro v1.0 loop: every {SCAN_EVERY_MIN}min · 4 instruments · ALERT_ONLY")
+    tg_send(f"SMC-Macro bot v1.0 online — 7-layer SMC pipeline × {len(INSTRUMENTS)} instruments\n"
+            f"Mode: ALERT_ONLY · scan every {SCAN_EVERY_MIN}min")
     while True:
         try: run_cycle(True)
-        except: log("Crash (alive):\n"+traceback.format_exc())
-        time.sleep(SCAN_EVERY_MIN*60)
+        except Exception: log("Crash (alive):\n" + traceback.format_exc())
+        time.sleep(SCAN_EVERY_MIN * 60)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()

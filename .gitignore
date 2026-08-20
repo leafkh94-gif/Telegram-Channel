@@ -11,3 +11,5 @@ backtest_results/
 *.db
 agent_state.json
 signals_log.csv
+smc_state.json
+smc_signals_log.csv
