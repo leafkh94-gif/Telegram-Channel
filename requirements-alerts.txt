@@ -1,6 +1,7 @@
 # Minimal dependencies for sweep_alert_agent.py (the cloud alert bot).
 # This installs in ~30s vs ~3min for the full requirements.txt.
+# Data comes exclusively from the Capital.com REST API (spec: no Yahoo Finance),
+# so yfinance is intentionally not a dependency.
 python-dotenv>=1.0.0
 requests>=2.31.0
 pandas>=2.0.0
-yfinance>=0.2.40

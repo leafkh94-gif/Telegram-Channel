@@ -48,11 +48,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            agent_state.json
-            signals_log.csv
-          key: agent-state-${{ github.run_id }}
+            smc_state.json
+            smc_signals_log.csv
+          key: smc-state-${{ github.run_id }}
           restore-keys: |
-            agent-state-
+            smc-state-
 
       - name: Run alert bot (continuous, ~5h40m then clean handoff)
         run: timeout 20400 python sweep_alert_agent.py || true
