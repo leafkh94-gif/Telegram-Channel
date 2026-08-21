@@ -12,10 +12,13 @@ load_dotenv()
 # pointed at "api-capital.backend.capsule.everi.one" — NOT Capital.com — which
 # would have sent the login identifier, password and API key to a third party.
 # Corrected to the official live/demo hosts, selected by CAPITAL_DEMO.
-CAPITAL_API_KEY    = os.getenv("CAPITAL_API_KEY", "")
-CAPITAL_PASSWORD   = os.getenv("CAPITAL_PASSWORD", "")
-CAPITAL_IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER", "")
-CAPITAL_DEMO       = os.getenv("CAPITAL_DEMO", "true").lower() == "true"
+# .strip() every credential: GitHub secrets frequently carry a trailing newline,
+# and requests raises "ValueError: Invalid header value" if the API key (sent as
+# the X-CAP-API-KEY header) contains one — which crash-loops the bot on startup.
+CAPITAL_API_KEY    = os.getenv("CAPITAL_API_KEY", "").strip()
+CAPITAL_PASSWORD   = os.getenv("CAPITAL_PASSWORD", "").strip()
+CAPITAL_IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER", "").strip()
+CAPITAL_DEMO       = os.getenv("CAPITAL_DEMO", "true").strip().lower() == "true"
 CAPITAL_BASE_URL   = (
     "https://demo-api-capital.backend-capital.com/api/v1" if CAPITAL_DEMO
     else "https://api-capital.backend-capital.com/api/v1"
@@ -24,8 +27,8 @@ CAPITAL_BASE_URL   = (
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 # Accept TELEGRAM_BOT_TOKEN (the name used by this repo's deployment secrets),
 # falling back to TELEGRAM_TOKEN for the bundle's original .env naming.
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN   = (os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("TELEGRAM_TOKEN", "")).strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # ─── الأدوات والإطارات الزمنية ─────────────────────────────────────────────────
 # Epics aligned to the ones proven against this Capital.com account (US100/US30/

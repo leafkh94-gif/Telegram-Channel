@@ -54,7 +54,10 @@ jobs:
             scalping-state-
 
       - name: Run alert bot (continuous, ~5h40m then clean handoff)
-        run: timeout 20400 python scalping_bot/main.py || true
+        run: |
+          start=$(date +%s)
+          timeout 20400 python scalping_bot/main.py || true
+          echo "RUN_ELAPSED=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -69,6 +72,13 @@ jobs:
       - name: Self-chain — queue the next run immediately
         if: always()
         run: |
+          # Crash-loop guard: only hand off if the bot actually ran a while. A fast
+          # exit means it crashed on startup — re-dispatching would flood. The hourly
+          # `schedule` cron still recovers the bot automatically once the cause is fixed.
+          if [ "${RUN_ELAPSED:-0}" -lt 300 ]; then
+            echo "Bot exited after ${RUN_ELAPSED:-0}s (<300s) — NOT self-chaining (crash-loop guard)."
+            exit 0
+          fi
           curl -s -X POST \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \

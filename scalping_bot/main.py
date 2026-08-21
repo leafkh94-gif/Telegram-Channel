@@ -210,8 +210,9 @@ def main():
             break
 
         except Exception as e:
+            # Log only — do NOT Telegram on every loop error, or a persistent fault
+            # turns into a message every 30s. Errors are visible in the run logs.
             logger.error(f"❌ خطأ رئيسي: {e}")
-            send_message(f"⚠️ خطأ غير متوقع:\n<code>{e}</code>")
             time.sleep(30)
 
 
