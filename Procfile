@@ -1,1 +1,1 @@
-web: python sweep_alert_agent.py
+web: python scalping_bot/main.py

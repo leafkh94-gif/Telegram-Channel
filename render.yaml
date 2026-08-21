@@ -3,12 +3,20 @@ services:
     name: gold-alert-bot
     env: python
     plan: free
-    buildCommand: pip install -r requirements-alerts.txt
-    startCommand: python sweep_alert_agent.py
+    buildCommand: pip install -r scalping_bot/requirements.txt
+    startCommand: python scalping_bot/main.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: ENVIRONMENT
-        value: development
+      - key: CAPITAL_API_KEY
+        sync: false
+      - key: CAPITAL_IDENTIFIER
+        sync: false
+      - key: CAPITAL_PASSWORD
+        sync: false
+      - key: CAPITAL_DEMO
+        value: "false"
+      - key: BOT_MODE
+        value: alert_only
