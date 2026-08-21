@@ -42,27 +42,29 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements-alerts.txt
+        run: pip install -r scalping_bot/requirements.txt
 
       - name: Restore agent state
         uses: actions/cache@v4
         with:
           path: |
-            smc_state.json
-            smc_signals_log.csv
-          key: smc-state-${{ github.run_id }}
+            risk_state.json
+          key: scalping-state-${{ github.run_id }}
           restore-keys: |
-            smc-state-
+            scalping-state-
 
       - name: Run alert bot (continuous, ~5h40m then clean handoff)
-        run: timeout 20400 python sweep_alert_agent.py || true
+        run: timeout 20400 python scalping_bot/main.py || true
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
           CAPITAL_API_KEY:      ${{ secrets.CAPITAL_API_KEY }}
           CAPITAL_IDENTIFIER:   ${{ secrets.CAPITAL_IDENTIFIER }}
           CAPITAL_PASSWORD:     ${{ secrets.CAPITAL_PASSWORD }}
-          ENVIRONMENT:          development
+          CAPITAL_DEMO:         "false"
+          # Safety: deploy stays in alert_only. Real order execution requires
+          # explicitly setting BOT_MODE=full_auto (spec: 30 paper setups first).
+          BOT_MODE:             alert_only
 
       - name: Self-chain — queue the next run immediately
         if: always()
