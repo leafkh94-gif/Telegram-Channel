@@ -99,43 +99,63 @@ def find_swing_lows(candles: list[dict], lookback: int = SWING_LOOKBACK) -> list
 def detect_trend_1h(candles: list[dict]) -> str:
     """
     يُعيد: "bullish" | "bearish" | "neutral"
-    المنطق: EMA 50 + تسلسل قمم وقيعان
+    المنطق: EMA 50 + تسلسل قمم وقيعان — يكفي واحد منهم مع عدم تعارض الآخر.
+
+    التعديل v1.1: الكود القديم كان يشترط تطابق EMA والـ Swings معاً،
+    مما أنتج neutral في أغلب الحالات حتى في أسواق واضحة الاتجاه.
     """
     if len(candles) < TREND_EMA_PERIOD + 5:
         return "neutral"
 
-    ema_values = calculate_ema(candles, TREND_EMA_PERIOD)
+    ema_values    = calculate_ema(candles, TREND_EMA_PERIOD)
     current_price = candles[-1]["close"]
     current_ema   = ema_values[-1]
 
     if current_ema is None:
         return "neutral"
 
+    # ─── تحيز EMA ─────────────────────────────────────────────────────────────
+    # نستخدم 0.1% كحد أدنى لتجنب الـ noise في المناطق الضيقة
+    ema_threshold = current_ema * 0.001
+    ema_diff      = current_price - current_ema
+
+    if ema_diff > ema_threshold:
+        ema_bias = "bullish"
+    elif ema_diff < -ema_threshold:
+        ema_bias = "bearish"
+    else:
+        ema_bias = "neutral"
+
+    # ─── تحيز الـ Swings ──────────────────────────────────────────────────────
     swing_highs = find_swing_highs(candles[-20:])
     swing_lows  = find_swing_lows(candles[-20:])
+    swing_bias  = "neutral"
 
-    # نحتاج على الأقل قمتين وقاعين
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        if current_price > current_ema:
-            return "bullish"
-        elif current_price < current_ema:
-            return "bearish"
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        is_hh_hl = (swing_highs[-1].price > swing_highs[-2].price and
+                    swing_lows[-1].price   > swing_lows[-2].price)
+        is_lh_ll = (swing_highs[-1].price < swing_highs[-2].price and
+                    swing_lows[-1].price   < swing_lows[-2].price)
+        if is_hh_hl:
+            swing_bias = "bullish"
+        elif is_lh_ll:
+            swing_bias = "bearish"
+
+    # ─── القرار النهائي ───────────────────────────────────────────────────────
+    # يكفي أن يكون أحدهما في اتجاه، بشرط ألا يكون الآخر في الاتجاه المعاكس.
+    # التعارض الصريح (أحدهما bullish والآخر bearish) → neutral.
+
+    if swing_bias == "bearish" and ema_bias == "bullish":
+        return "neutral"
+    if swing_bias == "bullish" and ema_bias == "bearish":
         return "neutral"
 
-    last_hh = swing_highs[-1].price
-    prev_hh = swing_highs[-2].price
-    last_ll = swing_lows[-1].price
-    prev_ll = swing_lows[-2].price
-
-    is_hh_hl = (last_hh > prev_hh) and (last_ll > prev_ll)
-    is_lh_ll = (last_hh < prev_hh) and (last_ll < prev_ll)
-
-    if is_hh_hl and current_price > current_ema:
+    if swing_bias == "bullish" or ema_bias == "bullish":
         return "bullish"
-    elif is_lh_ll and current_price < current_ema:
+    if swing_bias == "bearish" or ema_bias == "bearish":
         return "bearish"
-    else:
-        return "neutral"
+
+    return "neutral"
 
 
 # ─── Equal Highs / Lows ───────────────────────────────────────────────────────
