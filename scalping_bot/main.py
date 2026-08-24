@@ -13,7 +13,7 @@ from config import (
 )
 from capital_client  import CapitalClient
 from indicators      import detect_trend_1h
-from strategy_1_sweep import scan_setup_1
+import setup_tracker   # الإعداد الأول أصبح متتبّعاً بحالة مستمرة (Sweep→BOS→دخول)
 from strategy_2_news  import scan_setup_2, fetch_news_events, is_news_block_active
 from strategy_3_sd    import scan_setup_3
 from risk_manager     import can_trade, calculate_lot_size, record_trade_open, get_daily_stats
@@ -91,10 +91,11 @@ def scan_symbol(symbol: str, config: dict, client: CapitalClient,
     signal_found = None
     setup_num    = None
 
-    # ─ الإعداد الأول: Sweep + BOS
-    s1 = scan_setup_1(symbol, trend, candles_15m, candles_5m, current_price)
+    # ─ الإعداد الأول: Sweep → BOS (متتبّع بحالة مستمرة يتذكّر الـ Sweep عبر الفحوصات)
+    s1, s1_reason = setup_tracker.process(symbol, trend, candles_15m, candles_5m, current_price)
+    logger.info(f"🧭 {symbol} إعداد1: {s1_reason}")
     if s1:
-        logger.info(f"🎯 إعداد 1 مكتشف: {symbol} {s1.direction}")
+        logger.info(f"🎯 إعداد 1 مؤكَّد: {symbol} {s1.direction}")
         signal_found = s1
         setup_num    = 1
 
@@ -115,6 +116,8 @@ def scan_symbol(symbol: str, config: dict, client: CapitalClient,
             setup_num    = 3
 
     if not signal_found:
+        # تشخيص: لماذا لا توجد إشارة رغم وجود اتجاه — نُظهر أين توقّف كل إعداد
+        logger.info(f"❌ {symbol} لا إشارة (اتجاه={trend}) | إعداد1={s1_reason}")
         return
 
     # حساب حجم اللوت
