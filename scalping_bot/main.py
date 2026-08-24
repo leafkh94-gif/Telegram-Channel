@@ -190,10 +190,12 @@ def main():
                 time.sleep(60)
                 continue
 
-            # فحص الجلسة
-            if not is_session_active():
-                logger.info("💤 خارج ساعات التداول")
-                time.sleep(60)
+            # تحقق من عدم تداول يوم السبت والأحد (السوق مغلق) — البوت يعمل 24 ساعة
+            # من الاثنين للجمعة ويتوقف تلقائياً في عطلة نهاية الأسبوع.
+            weekday = datetime.now(timezone.utc).weekday()  # 5=سبت، 6=أحد
+            if weekday >= 5:
+                logger.info("💤 عطلة نهاية الأسبوع — السوق مغلق")
+                time.sleep(300)  # انتظر 5 دقائق بدل دقيقة
                 continue
 
             # فحص كل أداة
