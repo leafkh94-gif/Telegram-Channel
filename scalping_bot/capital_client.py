@@ -50,8 +50,16 @@ class CapitalClient:
     # ─── جلب الشموع ────────────────────────────────────────────────────────────
     def get_candles(self, epic: str, resolution: str, count: int = 50) -> list[dict]:
         """
-        جلب الشموع وعكس ترتيبها من الأقدم للأحدث.
-        Capital.com يُعيد الأحدث أولاً — نعكس دائماً.
+        جلب الشموع مرتبةً من الأقدم للأحدث حسب الوقت الحقيقي للشمعة.
+
+        ⚠️ إصلاح حرج: الكود السابق كان يفترض أن Capital.com يُعيد الأحدث أولاً
+        ويقلب القائمة دائماً (reversed). عملياً الـ API لا يضمن هذا الترتيب —
+        وحين يُعيد الأقدم أولاً كان القلب يجعل candles[-1] هي **أقدم** شمعة
+        (مثال حقيقي: آخر شمعة 1H = 29996 بينما السعر الحي 29050 — فرق 950 نقطة
+        ثابت لا يتحرك). النتيجة: EMA والقمم/القيعان والـ Sweep كلها تُحسب على
+        سلسلة مقلوبة زمنياً → اتجاه بلا معنى وصفر إشارات.
+
+        الحل: لا نفترض أي ترتيب — نرتّب فعلياً حسب snapshotTimeUTC تصاعدياً.
 
         resolution: MINUTE_5 | MINUTE_15 | HOUR | HOUR_4 | DAY
         """
@@ -63,20 +71,37 @@ class CapitalClient:
             r.raise_for_status()
             raw = r.json().get("prices", [])
 
-            # ⚠️ عكس الترتيب: الأقدم أولاً
-            candles = list(reversed(raw))
-
-            # تحويل لصيغة موحدة
+            # تحويل لصيغة موحدة (نتخطى أي شمعة ناقصة بدل أن نُسقط الطلب كله)
             result = []
-            for c in candles:
-                result.append({
-                    "time":  c.get("snapshotTimeUTC"),
-                    "open":  float(c["openPrice"]["bid"]),
-                    "high":  float(c["highPrice"]["bid"]),
-                    "low":   float(c["lowPrice"]["bid"]),
-                    "close": float(c["closePrice"]["bid"]),
-                    "volume": float(c.get("lastTradedVolume", 0))
-                })
+            for c in raw:
+                try:
+                    result.append({
+                        "time":  c.get("snapshotTimeUTC") or c.get("snapshotTime"),
+                        "open":  float(c["openPrice"]["bid"]),
+                        "high":  float(c["highPrice"]["bid"]),
+                        "low":   float(c["lowPrice"]["bid"]),
+                        "close": float(c["closePrice"]["bid"]),
+                        "volume": float(c.get("lastTradedVolume", 0))
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+            # ✅ الترتيب الحقيقي: الأقدم أولاً حسب وقت الشمعة، مع إزالة التكرار
+            result.sort(key=lambda x: x["time"] or "")
+            deduped, seen = [], set()
+            for c in result:
+                if c["time"] in seen:
+                    continue
+                seen.add(c["time"])
+                deduped.append(c)
+            result = deduped
+
+            if result:
+                logger.info(
+                    f"CANDLES {epic} {resolution} | عدد={len(result)} | "
+                    f"أقدم={result[0]['time']} ({result[0]['close']:.2f}) | "
+                    f"أحدث={result[-1]['time']} ({result[-1]['close']:.2f})"
+                )
             return result
         except Exception as e:
             logger.error(f"❌ خطأ جلب شموع {epic} {resolution}: {e}")
