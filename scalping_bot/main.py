@@ -20,10 +20,12 @@ from indicators       import detect_trend_1h
 from strategy_1_sweep import scan_setup_1
 from strategy_2_news  import scan_setup_2, fetch_news_events, is_news_block_active
 from strategy_3_sd    import scan_setup_3
+from strategy_4_continuation import scan_setup_4
 from risk_manager     import can_trade, calculate_lot_size, record_trade_open, get_daily_stats
 from telegram_bot     import (
     send_message, format_setup1_message, format_setup2_message,
-    format_setup3_message, send_halt_alert, send_news_block_alert,
+    format_setup3_message, format_setup4_message,
+    send_halt_alert, send_news_block_alert,
     process_commands
 )
 
@@ -122,11 +124,30 @@ def scan_symbol(
             signal_found = s3
             setup_num    = 3
 
+    # الإعداد الرابع: استمرارية الاتجاه (يمسك الأسواق المتجهة التي تعمى عنها 1-3)
+    if not signal_found:
+        s4 = scan_setup_4(symbol, trend, candles_15m, candles_5m, current_price)
+        if s4:
+            signal_found = s4
+            setup_num    = 4
+
     if not signal_found:
         return
 
     # حارس التكرار: أرسل كل إعداد مرة واحدة ثم اكتمه (يمنع إغراق نفس الإشارة كل دقيقة)
-    fp = f"{symbol}:{setup_num}:{signal_found.direction}:{round(signal_found.entry, 1)}"
+    # البصمة تُبنى على مرساة **بنيوية** ثابتة، لا على سعر الدخول.
+    # الإعداد الرابع يدخل بسعر السوق، فالدخول يتغيّر كل دقيقة — لو بصمنا عليه
+    # لاختلفت البصمة في كل فحص ولما عملت فترة التهدئة أبداً = إغراق.
+    # مستوى الاصطياد (إعداد 1) وقاع/قمة الساق (إعداد 4) يبقيان ثابتين ما دام
+    # الإعداد نفسه قائماً.
+    anchor = (
+        getattr(signal_found, "swept_level", None)
+        if getattr(signal_found, "swept_level", None) is not None
+        else getattr(signal_found, "leg_low", None)
+    )
+    if anchor is None:
+        anchor = signal_found.entry
+    fp = f"{symbol}:{setup_num}:{signal_found.direction}:{round(float(anchor), 1)}"
     if _is_duplicate(fp):
         logger.info(f"🔁 {symbol} إشارة مكررة — تخطي الإرسال ({fp})")
         return
@@ -138,8 +159,10 @@ def scan_symbol(
         msg = format_setup1_message(signal_found, lot_size, trend)
     elif setup_num == 2:
         msg = format_setup2_message(signal_found, lot_size, trend)
-    else:
+    elif setup_num == 3:
         msg = format_setup3_message(signal_found, lot_size, trend)
+    else:
+        msg = format_setup4_message(signal_found, lot_size, trend)
 
     if bot_mode == "alert_only":
         send_message(msg)

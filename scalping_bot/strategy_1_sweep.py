@@ -18,7 +18,8 @@ from indicators import (
 from config import (
     SWEEP_LOOKBACK_CANDLES, SWEEP_DETECTION_CANDLES,
     MAX_CANDLES_AFTER_SWEEP, SL_BUFFER_POINTS, ENTRY_RETRACE_PCT,
-    TP1_CLOSE_PCT_S1, MIN_RR_SETUP_1, EQUAL_LEVEL_TOLERANCE
+    TP1_CLOSE_PCT_S1, MIN_RR_SETUP_1, EQUAL_LEVEL_TOLERANCE,
+    ALLOW_COUNTER_TREND, MIN_RR_COUNTER_TREND, COUNTER_TREND_NEEDS_FVG
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class Setup1Signal:
     swept_level: float
     fvg:         Optional[FVG]
     confidence:  int
+    counter_trend: bool = False
 
 
 # ─── خريطة السيولة ────────────────────────────────────────────────────────────
@@ -58,19 +60,28 @@ def build_liquidity_map(candles_15m: list[dict]) -> dict:
     eq_highs    = find_equal_highs(recent, EQUAL_LEVEL_TOLERANCE)
     eq_lows     = find_equal_lows(recent,  EQUAL_LEVEL_TOLERANCE)
 
-    all_highs = sorted(set([s.price for s in swing_highs] + eq_highs), reverse=True)
-    all_lows  = sorted(set([s.price for s in swing_lows]  + eq_lows))
+    all_highs = set([s.price for s in swing_highs] + eq_highs)
+    all_lows  = set([s.price for s in swing_lows]  + eq_lows)
 
     current_price = candles_15m[-1]["close"]
 
-    bsl = [l for l in all_highs if l > current_price]
-    ssl = [l for l in all_lows  if l < current_price]
+    # FIX 8 — ترتيب مستويات السيولة حسب القرب من السعر (الأقرب أولاً).
+    # الخطأ السابق: all_highs كانت مرتّبة تنازلياً (reverse=True) ثم يؤخذ bsl[0]
+    # كـ "nearest_bsl" — وهو في الحقيقة **أعلى** قمة في النافذة، أي الأبعد عن
+    # السعر. في سوق هابط كل القمم فوق السعر، فكان البوت ينتظر ارتداداً حتى أعلى
+    # قمة في النافذة كلها ثم إغلاقاً تحتها ليعتبرها اصطياداً — وهذا لا يحدث أبداً
+    # على إطار سكالبينغ. النتيجة: صفر إعدادات هابطة في سوق هابط.
+    # كذلك كان اختيار الأهداف للشراء يأخذ bsl[0] كـ TP1 و bsl[1] كـ TP2 من قائمة
+    # تنازلية، فيصير TP2 **أقرب** من TP1 — أي معكوسين.
+    # الآن: القائمتان مرتّبتان بالقرب من السعر، فـ [0] هو الأقرب و [1] الذي يليه.
+    bsl = sorted([l for l in all_highs if l > current_price])                # تصاعدي: الأقرب فوق أولاً
+    ssl = sorted([l for l in all_lows  if l < current_price], reverse=True)  # تنازلي: الأقرب تحت أولاً
 
     return {
         "bsl": bsl,
         "ssl": ssl,
-        "nearest_bsl": bsl[0]  if bsl else None,
-        "nearest_ssl": ssl[-1] if ssl else None,
+        "nearest_bsl": bsl[0] if bsl else None,
+        "nearest_ssl": ssl[0] if ssl else None,
     }
 
 
@@ -88,6 +99,32 @@ def detect_sweep_15m(candles_15m: list[dict], liquidity_map: dict) -> Optional[S
 
     nearest_ssl = liquidity_map.get("nearest_ssl")
     nearest_bsl = liquidity_map.get("nearest_bsl")
+
+    def _no_sweep_reason() -> str:
+        """
+        تشخيص: حين لا يوجد اصطياد، نميّز بين ثلاث حالات مختلفة تماماً بدل الصمت:
+          1. السعر لم يقترب من السيولة أصلاً (سوق هادئ ضمن النطاق)
+          2. اخترق المستوى لكن أغلق خارجه (كسر حقيقي — ليس اصطياداً)
+          3. لا مستوى في ذلك الاتجاه
+        """
+        lows  = [c["low"]  for c in search]
+        highs = [c["high"] for c in search]
+        parts = []
+        if nearest_ssl is None:
+            parts.append("SSL: لا مستوى تحت السعر")
+        elif any(c["low"] < nearest_ssl for c in search):
+            n = sum(1 for c in search if c["low"] < nearest_ssl)
+            parts.append(f"SSL {nearest_ssl:.2f}: اخترق ({n} شمعة) لكن أغلق تحته = كسر لا اصطياد")
+        else:
+            parts.append(f"SSL {nearest_ssl:.2f}: لم يُلمس — أدنى قاع {min(lows):.2f} (يبعد {min(lows) - nearest_ssl:+.1f})")
+        if nearest_bsl is None:
+            parts.append("BSL: لا مستوى فوق السعر")
+        elif any(c["high"] > nearest_bsl for c in search):
+            n = sum(1 for c in search if c["high"] > nearest_bsl)
+            parts.append(f"BSL {nearest_bsl:.2f}: اخترق ({n} شمعة) لكن أغلق فوقه = كسر لا اصطياد")
+        else:
+            parts.append(f"BSL {nearest_bsl:.2f}: لم يُلمس — أعلى قمة {max(highs):.2f} (يبعد {max(highs) - nearest_bsl:+.1f})")
+        return " | ".join(parts)
 
     # نبحث من الأحدث للأقدم للحصول على آخر sweep
     for rev_i in range(n - 1, -1, -1):
@@ -126,6 +163,7 @@ def detect_sweep_15m(candles_15m: list[dict], liquidity_map: dict) -> Optional[S
                     candles_ago=candles_ago
                 )
 
+    logger.info(f"🔎 لا اصطياد خلال آخر {n} شمعة 15M | {_no_sweep_reason()}")
     return None
 
 
@@ -134,16 +172,19 @@ def detect_entry_after_sweep(
     candles_5m: list[dict],
     sweep: SweepEvent,
     trend: str
-) -> Optional[tuple[BOSEvent, Optional[FVG]]]:
+) -> Optional[tuple[BOSEvent, Optional[FVG], bool]]:
     """
     يبحث عن BOS في الـ 5M بعد وقت الـ Sweep مباشرة.
 
     الإصلاح: candles_ago × 3 = عدد شموع 5M المناظرة لوقت الـ Sweep.
     نفحص من تلك النقطة للأمام بدل أن نأخذ آخر 6 شموع دائماً.
     """
-    if sweep.direction == "bullish" and trend != "bullish":
-        return None
-    if sweep.direction == "bearish" and trend != "bearish":
+    counter_trend = (
+        (sweep.direction == "bullish" and trend != "bullish") or
+        (sweep.direction == "bearish" and trend != "bearish")
+    )
+    if counter_trend and not ALLOW_COUNTER_TREND:
+        logger.info(f"🔎 اصطياد {sweep.direction} لكن اتجاه 1H = {trend} — تعارض، تخطي")
         return None
 
     # احسب نقطة البداية في الـ 5M
@@ -155,23 +196,47 @@ def detect_entry_after_sweep(
     )
     window = candles_5m[-lookback_5m:] if len(candles_5m) >= lookback_5m else candles_5m
 
-    bos = detect_bos_choch(window, from_index=0)
-    if bos is None:
-        return None
+    # FIX 7 — نافذة الـ BOS كانت عمياء عن الشموع الحديثة.
+    # detect_bos_choch يفحص شريحة ثابتة من 8 شموع تبدأ عند from_index. الاستدعاء
+    # السابق كان from_index=0 دائماً، أي **أقدم** 8 شموع من النافذة فقط. مع
+    # candles_ago كبيرة تصل النافذة إلى 30 شمعة 5M (150 دقيقة) وكنا نفحص أول 40
+    # دقيقة منها ونتجاهل الـ 110 دقيقة التالية — فالـ BOS الذي وقع فعلاً بعد
+    # الاصطياد (وهو بطبيعته متأخر عنه) لا يُرى أبداً.
+    # الآن: نُمرّر شريحة الـ 8 عبر النافذة كلها ونأخذ أول BOS في اتجاه الاصطياد.
+    # كذلك كان فحص الاتجاه يُلغي الإعداد كله إذا صادف أن أول BOS معاكس؛ الآن
+    # نُكمل البحث بدل الانسحاب.
+    bos = None
+    for start in range(0, max(len(window) - 7, 1)):
+        candidate = detect_bos_choch(window, from_index=start)
+        if candidate is not None and candidate.direction == sweep.direction:
+            bos = candidate
+            break
 
-    if bos.direction != sweep.direction:
+    if bos is None:
+        logger.info(
+            f"🔎 اصطياد {sweep.direction} ✓ لكن لا BOS مطابق على 5M "
+            f"(نافذة {len(window)} شمعة بعد الاصطياد)"
+        )
         return None
 
     fvgs = find_fvg(window, lookback=len(window))
     matching_fvgs = [f for f in fvgs if f.direction == sweep.direction]
     best_fvg = matching_fvgs[-1] if matching_fvgs else None
 
+    # الإعداد المعاكس للاتجاه يحتاج دليل اندفاع (FVG) وإلا فهو مجرد ارتداد ضعيف
+    if counter_trend and COUNTER_TREND_NEEDS_FVG and best_fvg is None:
+        logger.info(
+            f"🔎 اصطياد {sweep.direction} معاكس لاتجاه {trend} وبلا FVG — تخطي"
+        )
+        return None
+
     logger.info(
         f"✅ {bos.kind} {bos.direction} @ {bos.level:.2f} | "
         f"FVG: {'نعم' if best_fvg else 'لا'} | "
         f"5M lookback: {lookback_5m}"
+        + (" | ⚠️ معاكس للاتجاه" if counter_trend else "")
     )
-    return (bos, best_fvg)
+    return (bos, best_fvg, counter_trend)
 
 
 # ─── حساب معاملات الدخول ─────────────────────────────────────────────────────
@@ -180,7 +245,8 @@ def calculate_setup1_levels(
     sweep: SweepEvent, bos: BOSEvent,
     fvg: Optional[FVG],
     liquidity_map: dict,
-    current_price: float
+    current_price: float,
+    counter_trend: bool = False
 ) -> Optional[Setup1Signal]:
 
     direction = "BUY" if sweep.direction == "bullish" else "SELL"
@@ -199,6 +265,8 @@ def calculate_setup1_levels(
         leg   = sweep.sweep_high - bos.level
         entry = sweep.sweep_high - leg * (1 - ENTRY_RETRACE_PCT)
 
+    # القائمتان مرتّبتان بالقرب من السعر أصلاً (FIX 8)، فالفلترة تحافظ على الترتيب:
+    # [0] = أقرب هدف، [1] = الذي يليه. لا حاجة لإعادة ترتيب.
     if direction == "BUY":
         sl  = sweep.sweep_low - SL_BUFFER_POINTS
         bsl = [l for l in liquidity_map["bsl"] if l > entry]
@@ -206,7 +274,7 @@ def calculate_setup1_levels(
         tp2 = bsl[1] if len(bsl) > 1 else entry + (entry - sl) * 3.5
     else:
         sl  = sweep.sweep_high + SL_BUFFER_POINTS
-        ssl = sorted([l for l in liquidity_map["ssl"] if l < entry], reverse=True)
+        ssl = [l for l in liquidity_map["ssl"] if l < entry]
         tp1 = ssl[0] if ssl else entry - (sl - entry) * 2
         tp2 = ssl[1] if len(ssl) > 1 else entry - (sl - entry) * 3.5
 
@@ -216,8 +284,14 @@ def calculate_setup1_levels(
         return None
     rr = tp1_dist / sl_dist
 
-    if rr < MIN_RR_SETUP_1:
-        logger.info(f"❌ RR {rr:.2f} < {MIN_RR_SETUP_1}")
+    min_rr = MIN_RR_COUNTER_TREND if counter_trend else MIN_RR_SETUP_1
+    if rr < min_rr:
+        logger.info(
+            f"❌ {symbol} RR {rr:.2f} < {min_rr}"
+            f"{' (معاكس)' if counter_trend else ''} | {direction} | "
+            f"دخول={entry:.2f} وقف={sl:.2f} (مخاطرة {sl_dist:.1f}) "
+            f"هدف={tp1:.2f} (ربح {tp1_dist:.1f}) | FVG={'نعم' if fvg else 'لا'}"
+        )
         return None
 
     confidence = 1
@@ -231,6 +305,7 @@ def calculate_setup1_levels(
         rr=round(rr, 2), setup_type=bos.kind,
         swept_level=sweep.swept_level,
         fvg=fvg, confidence=confidence,
+        counter_trend=counter_trend,
     )
 
 
@@ -247,6 +322,19 @@ def scan_setup_1(
 
     liquidity_map = build_liquidity_map(candles_15m)
 
+    # تشخيص المسار: سطر واحد لكل فحص يوضّح أين يتوقف القمع بالأرقام، بدل أن
+    # يمرّ الفحص صامتاً فلا نعرف هل السبب السيولة أم الاصطياد أم الـ BOS أم RR.
+    def _fmt(v) -> str:
+        return f"{v:.2f}" if v is not None else "—"
+
+    logger.info(
+        f"🧭 {symbol} FUNNEL | اتجاه={trend} | "
+        f"BSL={len(liquidity_map['bsl'])} SSL={len(liquidity_map['ssl'])} | "
+        f"أقرب BSL={_fmt(liquidity_map['nearest_bsl'])} "
+        f"أقرب SSL={_fmt(liquidity_map['nearest_ssl'])} | "
+        f"إغلاق 15M={candles_15m[-1]['close']:.2f}"
+    )
+
     if not liquidity_map["nearest_bsl"] and not liquidity_map["nearest_ssl"]:
         logger.info(f"⚠️ {symbol}: لا توجد مستويات سيولة")
         return None
@@ -259,7 +347,7 @@ def scan_setup_1(
     if result is None:
         return None
 
-    bos, fvg = result
+    bos, fvg, counter_trend = result
     return calculate_setup1_levels(
-        symbol, trend, sweep, bos, fvg, liquidity_map, current_price
+        symbol, trend, sweep, bos, fvg, liquidity_map, current_price, counter_trend
     )
