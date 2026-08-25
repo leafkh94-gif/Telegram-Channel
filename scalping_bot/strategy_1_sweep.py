@@ -58,19 +58,28 @@ def build_liquidity_map(candles_15m: list[dict]) -> dict:
     eq_highs    = find_equal_highs(recent, EQUAL_LEVEL_TOLERANCE)
     eq_lows     = find_equal_lows(recent,  EQUAL_LEVEL_TOLERANCE)
 
-    all_highs = sorted(set([s.price for s in swing_highs] + eq_highs), reverse=True)
-    all_lows  = sorted(set([s.price for s in swing_lows]  + eq_lows))
+    all_highs = set([s.price for s in swing_highs] + eq_highs)
+    all_lows  = set([s.price for s in swing_lows]  + eq_lows)
 
     current_price = candles_15m[-1]["close"]
 
-    bsl = [l for l in all_highs if l > current_price]
-    ssl = [l for l in all_lows  if l < current_price]
+    # FIX 8 — ترتيب مستويات السيولة حسب القرب من السعر (الأقرب أولاً).
+    # الخطأ السابق: all_highs كانت مرتّبة تنازلياً (reverse=True) ثم يؤخذ bsl[0]
+    # كـ "nearest_bsl" — وهو في الحقيقة **أعلى** قمة في النافذة، أي الأبعد عن
+    # السعر. في سوق هابط كل القمم فوق السعر، فكان البوت ينتظر ارتداداً حتى أعلى
+    # قمة في النافذة كلها ثم إغلاقاً تحتها ليعتبرها اصطياداً — وهذا لا يحدث أبداً
+    # على إطار سكالبينغ. النتيجة: صفر إعدادات هابطة في سوق هابط.
+    # كذلك كان اختيار الأهداف للشراء يأخذ bsl[0] كـ TP1 و bsl[1] كـ TP2 من قائمة
+    # تنازلية، فيصير TP2 **أقرب** من TP1 — أي معكوسين.
+    # الآن: القائمتان مرتّبتان بالقرب من السعر، فـ [0] هو الأقرب و [1] الذي يليه.
+    bsl = sorted([l for l in all_highs if l > current_price])                # تصاعدي: الأقرب فوق أولاً
+    ssl = sorted([l for l in all_lows  if l < current_price], reverse=True)  # تنازلي: الأقرب تحت أولاً
 
     return {
         "bsl": bsl,
         "ssl": ssl,
-        "nearest_bsl": bsl[0]  if bsl else None,
-        "nearest_ssl": ssl[-1] if ssl else None,
+        "nearest_bsl": bsl[0] if bsl else None,
+        "nearest_ssl": ssl[0] if ssl else None,
     }
 
 
@@ -242,6 +251,8 @@ def calculate_setup1_levels(
         leg   = sweep.sweep_high - bos.level
         entry = sweep.sweep_high - leg * (1 - ENTRY_RETRACE_PCT)
 
+    # القائمتان مرتّبتان بالقرب من السعر أصلاً (FIX 8)، فالفلترة تحافظ على الترتيب:
+    # [0] = أقرب هدف، [1] = الذي يليه. لا حاجة لإعادة ترتيب.
     if direction == "BUY":
         sl  = sweep.sweep_low - SL_BUFFER_POINTS
         bsl = [l for l in liquidity_map["bsl"] if l > entry]
@@ -249,7 +260,7 @@ def calculate_setup1_levels(
         tp2 = bsl[1] if len(bsl) > 1 else entry + (entry - sl) * 3.5
     else:
         sl  = sweep.sweep_high + SL_BUFFER_POINTS
-        ssl = sorted([l for l in liquidity_map["ssl"] if l < entry], reverse=True)
+        ssl = [l for l in liquidity_map["ssl"] if l < entry]
         tp1 = ssl[0] if ssl else entry - (sl - entry) * 2
         tp2 = ssl[1] if len(ssl) > 1 else entry - (sl - entry) * 3.5
 
