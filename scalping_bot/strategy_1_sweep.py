@@ -89,6 +89,32 @@ def detect_sweep_15m(candles_15m: list[dict], liquidity_map: dict) -> Optional[S
     nearest_ssl = liquidity_map.get("nearest_ssl")
     nearest_bsl = liquidity_map.get("nearest_bsl")
 
+    def _no_sweep_reason() -> str:
+        """
+        تشخيص: حين لا يوجد اصطياد، نميّز بين ثلاث حالات مختلفة تماماً بدل الصمت:
+          1. السعر لم يقترب من السيولة أصلاً (سوق هادئ ضمن النطاق)
+          2. اخترق المستوى لكن أغلق خارجه (كسر حقيقي — ليس اصطياداً)
+          3. لا مستوى في ذلك الاتجاه
+        """
+        lows  = [c["low"]  for c in search]
+        highs = [c["high"] for c in search]
+        parts = []
+        if nearest_ssl is None:
+            parts.append("SSL: لا مستوى تحت السعر")
+        elif any(c["low"] < nearest_ssl for c in search):
+            n = sum(1 for c in search if c["low"] < nearest_ssl)
+            parts.append(f"SSL {nearest_ssl:.2f}: اخترق ({n} شمعة) لكن أغلق تحته = كسر لا اصطياد")
+        else:
+            parts.append(f"SSL {nearest_ssl:.2f}: لم يُلمس — أدنى قاع {min(lows):.2f} (يبعد {min(lows) - nearest_ssl:+.1f})")
+        if nearest_bsl is None:
+            parts.append("BSL: لا مستوى فوق السعر")
+        elif any(c["high"] > nearest_bsl for c in search):
+            n = sum(1 for c in search if c["high"] > nearest_bsl)
+            parts.append(f"BSL {nearest_bsl:.2f}: اخترق ({n} شمعة) لكن أغلق فوقه = كسر لا اصطياد")
+        else:
+            parts.append(f"BSL {nearest_bsl:.2f}: لم يُلمس — أعلى قمة {max(highs):.2f} (يبعد {max(highs) - nearest_bsl:+.1f})")
+        return " | ".join(parts)
+
     # نبحث من الأحدث للأقدم للحصول على آخر sweep
     for rev_i in range(n - 1, -1, -1):
         c          = search[rev_i]
@@ -126,6 +152,7 @@ def detect_sweep_15m(candles_15m: list[dict], liquidity_map: dict) -> Optional[S
                     candles_ago=candles_ago
                 )
 
+    logger.info(f"🔎 لا اصطياد خلال آخر {n} شمعة 15M | {_no_sweep_reason()}")
     return None
 
 
@@ -141,9 +168,9 @@ def detect_entry_after_sweep(
     الإصلاح: candles_ago × 3 = عدد شموع 5M المناظرة لوقت الـ Sweep.
     نفحص من تلك النقطة للأمام بدل أن نأخذ آخر 6 شموع دائماً.
     """
-    if sweep.direction == "bullish" and trend != "bullish":
-        return None
-    if sweep.direction == "bearish" and trend != "bearish":
+    if (sweep.direction == "bullish" and trend != "bullish") or \
+       (sweep.direction == "bearish" and trend != "bearish"):
+        logger.info(f"🔎 اصطياد {sweep.direction} لكن اتجاه 1H = {trend} — تعارض، تخطي")
         return None
 
     # احسب نقطة البداية في الـ 5M
@@ -155,11 +182,27 @@ def detect_entry_after_sweep(
     )
     window = candles_5m[-lookback_5m:] if len(candles_5m) >= lookback_5m else candles_5m
 
-    bos = detect_bos_choch(window, from_index=0)
-    if bos is None:
-        return None
+    # FIX 7 — نافذة الـ BOS كانت عمياء عن الشموع الحديثة.
+    # detect_bos_choch يفحص شريحة ثابتة من 8 شموع تبدأ عند from_index. الاستدعاء
+    # السابق كان from_index=0 دائماً، أي **أقدم** 8 شموع من النافذة فقط. مع
+    # candles_ago كبيرة تصل النافذة إلى 30 شمعة 5M (150 دقيقة) وكنا نفحص أول 40
+    # دقيقة منها ونتجاهل الـ 110 دقيقة التالية — فالـ BOS الذي وقع فعلاً بعد
+    # الاصطياد (وهو بطبيعته متأخر عنه) لا يُرى أبداً.
+    # الآن: نُمرّر شريحة الـ 8 عبر النافذة كلها ونأخذ أول BOS في اتجاه الاصطياد.
+    # كذلك كان فحص الاتجاه يُلغي الإعداد كله إذا صادف أن أول BOS معاكس؛ الآن
+    # نُكمل البحث بدل الانسحاب.
+    bos = None
+    for start in range(0, max(len(window) - 7, 1)):
+        candidate = detect_bos_choch(window, from_index=start)
+        if candidate is not None and candidate.direction == sweep.direction:
+            bos = candidate
+            break
 
-    if bos.direction != sweep.direction:
+    if bos is None:
+        logger.info(
+            f"🔎 اصطياد {sweep.direction} ✓ لكن لا BOS مطابق على 5M "
+            f"(نافذة {len(window)} شمعة بعد الاصطياد)"
+        )
         return None
 
     fvgs = find_fvg(window, lookback=len(window))
@@ -217,7 +260,11 @@ def calculate_setup1_levels(
     rr = tp1_dist / sl_dist
 
     if rr < MIN_RR_SETUP_1:
-        logger.info(f"❌ RR {rr:.2f} < {MIN_RR_SETUP_1}")
+        logger.info(
+            f"❌ {symbol} RR {rr:.2f} < {MIN_RR_SETUP_1} | {direction} | "
+            f"دخول={entry:.2f} وقف={sl:.2f} (مخاطرة {sl_dist:.1f}) "
+            f"هدف={tp1:.2f} (ربح {tp1_dist:.1f}) | FVG={'نعم' if fvg else 'لا'}"
+        )
         return None
 
     confidence = 1
@@ -246,6 +293,19 @@ def scan_setup_1(
         return None
 
     liquidity_map = build_liquidity_map(candles_15m)
+
+    # تشخيص المسار: سطر واحد لكل فحص يوضّح أين يتوقف القمع بالأرقام، بدل أن
+    # يمرّ الفحص صامتاً فلا نعرف هل السبب السيولة أم الاصطياد أم الـ BOS أم RR.
+    def _fmt(v) -> str:
+        return f"{v:.2f}" if v is not None else "—"
+
+    logger.info(
+        f"🧭 {symbol} FUNNEL | اتجاه={trend} | "
+        f"BSL={len(liquidity_map['bsl'])} SSL={len(liquidity_map['ssl'])} | "
+        f"أقرب BSL={_fmt(liquidity_map['nearest_bsl'])} "
+        f"أقرب SSL={_fmt(liquidity_map['nearest_ssl'])} | "
+        f"إغلاق 15M={candles_15m[-1]['close']:.2f}"
+    )
 
     if not liquidity_map["nearest_bsl"] and not liquidity_map["nearest_ssl"]:
         logger.info(f"⚠️ {symbol}: لا توجد مستويات سيولة")
