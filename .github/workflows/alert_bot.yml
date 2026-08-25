@@ -13,7 +13,10 @@ name: Trading Alert Bot
 on:
   workflow_dispatch:        # manual start / restart from the Actions tab
   schedule:
-    - cron: '0 * * * *'    # recovery watchdog: hourly (cron is unreliable; self-chain is primary)
+    # حارس تعافٍ فقط — السلسلة الذاتية (self-chain) هي الآلية الأساسية.
+    # كان كل ساعة؛ مع cancel-in-progress: true صار ذلك يعيد تشغيل البوت كل ساعة
+    # ويصفّر ذاكرة منع التكرار (dedup) فتتكرّر الإشارات. كل 6 ساعات يكفي للتعافي.
+    - cron: '17 */6 * * *'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # suppress Node.js 20 deprecation warnings
@@ -24,7 +27,11 @@ permissions:
 
 concurrency:
   group: trading-bot
-  cancel-in-progress: false  # never kill the live run; let the new one queue
+  # كان false: التشغيل القديم يبقى ماسكاً المكان حتى 5h40m، فأي كود جديد
+  # يُدمج لا يعمل إطلاقاً إلا بإلغاء التشغيل القديم يدوياً (تكرّر 3 مرات:
+  # v2 والـ trend fix وإصلاح الدخول كلها بقيت معطّلة بينما القديم يعمل).
+  # الآن true: التشغيل الأحدث يلغي القديم ويأخذ مكانه فوراً — أحدث كود يفوز.
+  cancel-in-progress: true
 
 jobs:
   run:
