@@ -17,7 +17,7 @@ from indicators import (
 )
 from config import (
     SWEEP_LOOKBACK_CANDLES, SWEEP_DETECTION_CANDLES,
-    MAX_CANDLES_AFTER_SWEEP, SL_BUFFER_POINTS,
+    MAX_CANDLES_AFTER_SWEEP, SL_BUFFER_POINTS, ENTRY_RETRACE_PCT,
     TP1_CLOSE_PCT_S1, MIN_RR_SETUP_1, EQUAL_LEVEL_TOLERANCE
 )
 
@@ -185,7 +185,19 @@ def calculate_setup1_levels(
 
     direction = "BUY" if sweep.direction == "bullish" else "SELL"
 
-    entry = fvg.mid if fvg else bos.level
+    # FIX 4: نقطة الدخول.
+    # كان: entry = bos.level حين لا يوجد FVG — أي الدخول عند قمة الاندفاع بينما
+    # الوقف عند قاع الاصطياد، فالمخاطرة = الساق كاملة و RR < 1 دائماً.
+    # الآن: ننتظر ارتداداً داخل ساق (الاصطياد → BOS) وندخل بخصم عند ENTRY_RETRACE_PCT
+    # (0.618 = منطقة OTE). أمر الدخول LIMIT ينتظر عودة السعر — لا نلاحق القمة.
+    if fvg:
+        entry = fvg.mid
+    elif direction == "BUY":
+        leg   = bos.level - sweep.sweep_low
+        entry = sweep.sweep_low + leg * (1 - ENTRY_RETRACE_PCT)
+    else:
+        leg   = sweep.sweep_high - bos.level
+        entry = sweep.sweep_high - leg * (1 - ENTRY_RETRACE_PCT)
 
     if direction == "BUY":
         sl  = sweep.sweep_low - SL_BUFFER_POINTS
