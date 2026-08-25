@@ -48,8 +48,9 @@ def format_setup1_message(signal, lot_size: float, trend: str) -> str:
         f"TP2       : <code>{signal.tp2}</code>\n"
         f"الحجم     : <code>{lot_size}</code> لوت\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"الاتجاه 1H : {trend.upper()}\n"
-        f"مستوى Sweep: <code>{signal.swept_level}</code>\n"
+        f"الاتجاه 1H : {trend.upper()}"
+        + ("  ⚠️ <b>الصفقة معاكسة للاتجاه</b>\n" if getattr(signal, 'counter_trend', False) else "\n")
+        + f"مستوى Sweep: <code>{signal.swept_level}</code>\n"
         f"FVG       : {'✅' if signal.fvg else '❌'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ الدخول صالح لـ 30 دقيقة"
@@ -191,3 +192,31 @@ def process_commands(bot_state: dict) -> dict:
             send_daily_stats(get_daily_stats())
 
     return bot_state
+
+
+def format_setup4_message(signal, lot_size: float, trend: str) -> str:
+    """الإعداد الرابع — استمرارية الاتجاه (لا يعتمد على اصطياد سيولة)"""
+    arrow = "🟢 شراء" if signal.direction == "BUY" else "🔴 بيع"
+    stars = "⭐" * signal.confidence
+    leg   = abs(signal.leg_high - signal.leg_low)
+    return (
+        f"🔔 <b>إشارة سكالبينغ — {signal.symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"الإعداد   : <b>استمرارية الاتجاه</b>\n"
+        f"الاتجاه   : <b>{arrow}</b>\n"
+        f"الثقة     : {stars}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"الدخول    : <code>{signal.entry}</code>\n"
+        f"SL        : <code>{signal.sl}</code>\n"
+        f"TP1       : <code>{signal.tp1}</code>  (RR {signal.rr:.1f}:1)\n"
+        f"TP2       : <code>{signal.tp2}</code>\n"
+        f"الحجم     : <code>{lot_size}</code> لوت\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"الاتجاه 1H : {trend.upper()}\n"
+        f"ساق الاندفاع: <code>{leg:.0f}</code> نقطة "
+        f"({signal.leg_low} → {signal.leg_high})\n"
+        f"الارتداد  : {signal.retrace_pct:.1%}\n"
+        f"FVG       : {'✅' if signal.fvg else '❌'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ الدخول صالح لـ 30 دقيقة"
+    )

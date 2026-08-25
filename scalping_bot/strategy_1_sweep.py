@@ -18,7 +18,8 @@ from indicators import (
 from config import (
     SWEEP_LOOKBACK_CANDLES, SWEEP_DETECTION_CANDLES,
     MAX_CANDLES_AFTER_SWEEP, SL_BUFFER_POINTS, ENTRY_RETRACE_PCT,
-    TP1_CLOSE_PCT_S1, MIN_RR_SETUP_1, EQUAL_LEVEL_TOLERANCE
+    TP1_CLOSE_PCT_S1, MIN_RR_SETUP_1, EQUAL_LEVEL_TOLERANCE,
+    ALLOW_COUNTER_TREND, MIN_RR_COUNTER_TREND, COUNTER_TREND_NEEDS_FVG
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class Setup1Signal:
     swept_level: float
     fvg:         Optional[FVG]
     confidence:  int
+    counter_trend: bool = False
 
 
 # ─── خريطة السيولة ────────────────────────────────────────────────────────────
@@ -170,15 +172,18 @@ def detect_entry_after_sweep(
     candles_5m: list[dict],
     sweep: SweepEvent,
     trend: str
-) -> Optional[tuple[BOSEvent, Optional[FVG]]]:
+) -> Optional[tuple[BOSEvent, Optional[FVG], bool]]:
     """
     يبحث عن BOS في الـ 5M بعد وقت الـ Sweep مباشرة.
 
     الإصلاح: candles_ago × 3 = عدد شموع 5M المناظرة لوقت الـ Sweep.
     نفحص من تلك النقطة للأمام بدل أن نأخذ آخر 6 شموع دائماً.
     """
-    if (sweep.direction == "bullish" and trend != "bullish") or \
-       (sweep.direction == "bearish" and trend != "bearish"):
+    counter_trend = (
+        (sweep.direction == "bullish" and trend != "bullish") or
+        (sweep.direction == "bearish" and trend != "bearish")
+    )
+    if counter_trend and not ALLOW_COUNTER_TREND:
         logger.info(f"🔎 اصطياد {sweep.direction} لكن اتجاه 1H = {trend} — تعارض، تخطي")
         return None
 
@@ -218,12 +223,20 @@ def detect_entry_after_sweep(
     matching_fvgs = [f for f in fvgs if f.direction == sweep.direction]
     best_fvg = matching_fvgs[-1] if matching_fvgs else None
 
+    # الإعداد المعاكس للاتجاه يحتاج دليل اندفاع (FVG) وإلا فهو مجرد ارتداد ضعيف
+    if counter_trend and COUNTER_TREND_NEEDS_FVG and best_fvg is None:
+        logger.info(
+            f"🔎 اصطياد {sweep.direction} معاكس لاتجاه {trend} وبلا FVG — تخطي"
+        )
+        return None
+
     logger.info(
         f"✅ {bos.kind} {bos.direction} @ {bos.level:.2f} | "
         f"FVG: {'نعم' if best_fvg else 'لا'} | "
         f"5M lookback: {lookback_5m}"
+        + (" | ⚠️ معاكس للاتجاه" if counter_trend else "")
     )
-    return (bos, best_fvg)
+    return (bos, best_fvg, counter_trend)
 
 
 # ─── حساب معاملات الدخول ─────────────────────────────────────────────────────
@@ -232,7 +245,8 @@ def calculate_setup1_levels(
     sweep: SweepEvent, bos: BOSEvent,
     fvg: Optional[FVG],
     liquidity_map: dict,
-    current_price: float
+    current_price: float,
+    counter_trend: bool = False
 ) -> Optional[Setup1Signal]:
 
     direction = "BUY" if sweep.direction == "bullish" else "SELL"
@@ -270,9 +284,11 @@ def calculate_setup1_levels(
         return None
     rr = tp1_dist / sl_dist
 
-    if rr < MIN_RR_SETUP_1:
+    min_rr = MIN_RR_COUNTER_TREND if counter_trend else MIN_RR_SETUP_1
+    if rr < min_rr:
         logger.info(
-            f"❌ {symbol} RR {rr:.2f} < {MIN_RR_SETUP_1} | {direction} | "
+            f"❌ {symbol} RR {rr:.2f} < {min_rr}"
+            f"{' (معاكس)' if counter_trend else ''} | {direction} | "
             f"دخول={entry:.2f} وقف={sl:.2f} (مخاطرة {sl_dist:.1f}) "
             f"هدف={tp1:.2f} (ربح {tp1_dist:.1f}) | FVG={'نعم' if fvg else 'لا'}"
         )
@@ -289,6 +305,7 @@ def calculate_setup1_levels(
         rr=round(rr, 2), setup_type=bos.kind,
         swept_level=sweep.swept_level,
         fvg=fvg, confidence=confidence,
+        counter_trend=counter_trend,
     )
 
 
@@ -330,7 +347,7 @@ def scan_setup_1(
     if result is None:
         return None
 
-    bos, fvg = result
+    bos, fvg, counter_trend = result
     return calculate_setup1_levels(
-        symbol, trend, sweep, bos, fvg, liquidity_map, current_price
+        symbol, trend, sweep, bos, fvg, liquidity_map, current_price, counter_trend
     )
