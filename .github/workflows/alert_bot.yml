@@ -56,6 +56,7 @@ jobs:
         with:
           path: |
             risk_state.json
+            signals_log.csv
           key: scalping-state-${{ github.run_id }}
           restore-keys: |
             scalping-state-
