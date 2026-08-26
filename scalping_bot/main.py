@@ -21,6 +21,7 @@ from strategy_1_sweep import scan_setup_1
 from strategy_2_news  import scan_setup_2, fetch_news_events, is_news_block_active
 from strategy_3_sd    import scan_setup_3
 from strategy_4_continuation import scan_setup_4
+from tracker          import log_signal, update_open_signals
 from risk_manager     import can_trade, calculate_lot_size, record_trade_open, get_daily_stats
 from telegram_bot     import (
     send_message, format_setup1_message, format_setup2_message,
@@ -68,7 +69,8 @@ def scan_symbol(
     symbol: str, config: dict,
     client: CapitalClient,
     news_events: list,
-    bot_mode: str
+    bot_mode: str,
+    candles_out: dict | None = None
 ) -> None:
 
     epic = config["epic"]
@@ -81,6 +83,10 @@ def scan_symbol(
     if not candles_1h or not candles_15m or not candles_5m:
         logger.warning(f"⚠️ بيانات ناقصة: {symbol}")
         return
+
+    # نمرّر شموع 5M لمتابعة الإشارات السابقة حتى لو لم تُنتج هذه الدورة إشارة
+    if candles_out is not None:
+        candles_out[symbol] = candles_5m
 
     price_data = client.get_current_price(epic)
     if not price_data:
@@ -164,6 +170,8 @@ def scan_symbol(
     else:
         msg = format_setup4_message(signal_found, lot_size, trend)
 
+    log_signal(signal_found, setup_num, symbol, trend, lot_size)
+
     if bot_mode == "alert_only":
         send_message(msg)
         logger.info(f"📤 إشارة أُرسلت: {symbol} {signal_found.direction}")
@@ -229,11 +237,19 @@ def main():
 
             # ─ فحص الأدوات
             current_mode = bot_state["mode"]
+            candles_5m_all: dict = {}
             for symbol, config in SYMBOLS.items():
                 try:
-                    scan_symbol(symbol, config, client, news_events, current_mode)
+                    scan_symbol(symbol, config, client, news_events,
+                                current_mode, candles_5m_all)
                 except Exception as e:
                     logger.error(f"❌ خطأ {symbol}: {e}")
+
+            # متابعة نتائج الإشارات السابقة (آلياً — بلا أي تأكيد يدوي)
+            try:
+                update_open_signals(candles_5m_all)
+            except Exception as e:
+                logger.error(f"❌ خطأ متابعة الإشارات: {e}")
 
             logger.info(f"✅ دورة مكتملة — انتظار {SCAN_INTERVAL_SECONDS}s")
             time.sleep(SCAN_INTERVAL_SECONDS)

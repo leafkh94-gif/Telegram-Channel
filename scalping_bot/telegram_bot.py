@@ -166,6 +166,14 @@ def process_commands(bot_state: dict) -> dict:
             send_daily_stats(stats)
             send_message(f"وضع التشغيل: <b>{mode}</b>")
 
+        elif text in ("/report", "/تقرير"):
+            from tracker import build_report
+            send_message(build_report(days=1))
+
+        elif text in ("/report7", "/week"):
+            from tracker import build_report
+            send_message(build_report(days=7))
+
         elif text == "/pause":
             bot_state["paused"] = True
             send_message("⏸ البوت متوقف مؤقتاً. أرسل /resume للاستئناف.")
