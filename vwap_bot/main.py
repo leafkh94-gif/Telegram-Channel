@@ -1,0 +1,195 @@
+"""
+═══════════════════════════════════════════════════════════════════════════════
+                    بوت VWAP Scalping — النسخة النهائية v3
+═══════════════════════════════════════════════════════════════════════════════
+
+⚠️⚠️⚠️  تعليمات للمبرمج — اقرأها أولاً قبل التشغيل  ⚠️⚠️⚠️
+
+هذه النسخة تستبدل كل الاستراتيجيات القديمة بالكامل.
+يجب حذف الملفات التالية من المشروع قبل التشغيل:
+
+    ❌ احذف: strategy_1_sweep.py
+    ❌ احذف: strategy_2_news.py
+    ❌ احذف: strategy_3_sd.py
+    ❌ احذف: أي ملف قديم باسم indicators.py (استبدله بالجديد)
+    ❌ احذف: أي ملف قديم باسم config.py (استبدله بالجديد)
+
+الملفات الجديدة المطلوبة (فقط هذه):
+    ✅ config.py
+    ✅ indicators.py
+    ✅ strategy.py          ← الاستراتيجية الوحيدة الآن
+    ✅ capital_client.py
+    ✅ risk_manager.py
+    ✅ telegram_bot.py
+    ✅ main.py              ← هذا الملف
+
+أمر الحذف السريع (نفّذه في مجلد المشروع):
+    rm -f strategy_1_sweep.py strategy_2_news.py strategy_3_sd.py
+
+═══════════════════════════════════════════════════════════════════════════════
+
+منطق الاستراتيجية (مبني على بحث حقيقي — إجماع المصادر المحترفة):
+    1. VWAP:  السعر فوق = شراء فقط | تحت = بيع فقط
+    2. EMA:   السعر فوق EMA9 و EMA9 > EMA21 (شراء) | العكس (بيع)
+    3. RSI:   RSI(3) ضمن النطاق الصحي (زخم بلا تشبع)
+    4. ATR:   Stop = 1× ATR | Target = 2× ATR (RR 1:2)
+    5. الوقت: جلسة نيويورك فقط
+
+يعمل على: US100 | US30 | US500 | XAUUSD (الذهب)
+24 ساعة من الاثنين للجمعة | يتوقف السبت والأحد
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
+import time
+import logging
+from datetime import datetime, timezone, timedelta
+
+from config import (
+    SYMBOLS, TIMEFRAME_ENTRY, CANDLES_COUNT,
+    SESSION_START_UTC, SESSION_END_UTC,
+    SCAN_INTERVAL_SECONDS, BOT_MODE
+)
+from capital_client import CapitalClient
+from strategy       import scan
+from risk_manager   import can_trade, calculate_lot_size, record_trade_open, get_daily_stats
+from telegram_bot   import send_message, format_signal, process_commands
+from tracker        import log_signal, update_open_signals
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ]
+)
+logger = logging.getLogger("MAIN")
+
+
+def is_weekend() -> bool:
+    return datetime.now(timezone.utc).weekday() >= 5
+
+
+def is_session_active() -> bool:
+    now = datetime.now(timezone.utc)
+    cur = now.hour * 60 + now.minute
+    start = SESSION_START_UTC[0] * 60 + SESSION_START_UTC[1]
+    end   = SESSION_END_UTC[0]   * 60 + SESSION_END_UTC[1]
+    return start <= cur <= end
+
+
+# ─── منع تكرار الإشارات ──────────────────────────────────────────────────────
+# شروط هذه الاستراتيجية حالة مستمرة، لا حدثاً لحظياً: طالما السعر فوق VWAP و
+# الـ EMA مرتّبة و RSI فوق 50، تبقى الشروط صحيحة عشرات الشموع. مع فحص كل 60
+# ثانية وشمعة 5 دقائق، تُرسل نفس الإشارة ~145 مرة للحركة الواحدة (قياس فعلي).
+# هذا الحارس يرسل الإشارة مرة ثم يكتمها مدة تهدئة.
+_ALERT_COOLDOWN_MIN = 45
+_recent_alerts: dict = {}
+
+def _is_duplicate(fp: str) -> bool:
+    t = _recent_alerts.get(fp)
+    return t is not None and (datetime.now(timezone.utc) - t) < timedelta(minutes=_ALERT_COOLDOWN_MIN)
+
+
+def scan_symbol(symbol: str, config: dict, client: CapitalClient, bot_mode: str,
+                candles_out: dict | None = None):
+    epic = config["epic"]
+
+    candles = client.get_candles(epic, TIMEFRAME_ENTRY, CANDLES_COUNT)
+    if not candles:
+        logger.warning(f"⚠️ {symbol}: لا بيانات")
+        return
+
+    if candles_out is not None:
+        candles_out[symbol] = candles
+
+    signal = scan(symbol, candles)
+    if signal is None:
+        return
+
+    balance  = client.get_account_balance()
+    open_pos = client.get_open_positions()
+    allowed, reason = can_trade(balance, len(open_pos))
+    if not allowed:
+        logger.info(f"🚫 {reason}")
+        return
+
+    # الاتجاه وحده كبصمة: السعر يتغيّر كل فحص، فلو بصمنا عليه لما عملت التهدئة.
+    fp = f"{symbol}:{signal.direction}"
+    if _is_duplicate(fp):
+        logger.info(f"🔁 {symbol} {signal.direction} — إشارة مكتومة (تهدئة)")
+        return
+    _recent_alerts[fp] = datetime.now(timezone.utc)
+
+    lot_size = calculate_lot_size(symbol, balance, signal.entry, signal.sl)
+    msg = format_signal(signal, lot_size)
+    log_signal(signal, symbol, lot_size)
+
+    if bot_mode == "alert_only":
+        send_message(msg)
+        logger.info(f"📤 إشارة أُرسلت: {symbol} {signal.direction}")
+    elif bot_mode == "full_auto":
+        send_message(msg)
+        result = client.place_order(
+            epic=epic, direction=signal.direction, size=lot_size,
+            stop_level=signal.sl, profit_level=signal.tp
+        )
+        if result:
+            record_trade_open()
+
+
+def main():
+    logger.info("🚀 بوت VWAP Scalping v3 — بدء")
+    send_message(
+        f"🤖 <b>بوت VWAP Scalping — يعمل</b>\n"
+        f"الوضع: {BOT_MODE}\n"
+        f"الأدوات: US100 · US30 · US500 · XAUUSD\n"
+        f"المنطق: VWAP + EMA + RSI + ATR"
+    )
+
+    client    = CapitalClient()
+    bot_state = {"mode": BOT_MODE, "paused": False, "offset": 0}
+
+    while True:
+        try:
+            bot_state = process_commands(bot_state)
+
+            if bot_state["paused"]:
+                time.sleep(SCAN_INTERVAL_SECONDS)
+                continue
+
+            if is_weekend():
+                logger.info("🔴 عطلة نهاية الأسبوع")
+                time.sleep(300)
+                continue
+
+            if not is_session_active():
+                logger.info("💤 خارج جلسة نيويورك")
+                time.sleep(120)
+                continue
+
+            candles_all: dict = {}
+            for symbol, config in SYMBOLS.items():
+                try:
+                    scan_symbol(symbol, config, client, bot_state["mode"], candles_all)
+                except Exception as e:
+                    logger.error(f"❌ خطأ {symbol}: {e}")
+
+            try:
+                update_open_signals(candles_all)
+            except Exception as e:
+                logger.error(f"❌ خطأ متابعة الإشارات: {e}")
+
+            logger.info(f"✅ دورة مكتملة — انتظار {SCAN_INTERVAL_SECONDS}s")
+            time.sleep(SCAN_INTERVAL_SECONDS)
+
+        except KeyboardInterrupt:
+            send_message("🛑 البوت أُوقف يدوياً")
+            break
+        except Exception as e:
+            logger.error(f"❌ خطأ رئيسي: {e}")
+            time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()

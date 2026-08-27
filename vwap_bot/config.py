@@ -1,0 +1,75 @@
+"""
+config.py — إعدادات بوت VWAP Scalping (v3 — بناء جديد من الصفر)
+
+مبني على بحث حقيقي: إجماع المصادر المحترفة على VWAP + EMA + RSI + ATR.
+يستبدل كل الاستراتيجيات السابقة (Sweep/News/S&D).
+"""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─── Capital.com API ───────────────────────────────────────────────────────────
+# .strip() ضروري وليس تجميلاً: أسرار GitHub غالباً فيها سطر جديد زائد، و requests
+# يرفض قيمة هيدر تحتوي "\n" برمي ValueError عند الإقلاع. هذا بالضبط ما سبّب
+# انهياراً متكرراً سابقاً — كل تشغيل يموت خلال ثوانٍ ويُعيد إطلاق نفسه، فوصلتك
+# رسالة "البوت يعمل" كل ثانية تقريباً.
+CAPITAL_API_KEY    = os.getenv("CAPITAL_API_KEY", "").strip()
+CAPITAL_PASSWORD   = os.getenv("CAPITAL_PASSWORD", "").strip()
+CAPITAL_IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER", "").strip()
+CAPITAL_DEMO       = os.getenv("CAPITAL_DEMO", "true").strip().lower() == "true"
+# الرابط يتحدد تلقائياً حسب demo/live
+if CAPITAL_DEMO:
+    CAPITAL_BASE_URL = "https://demo-api-capital.backend-capital.com/api/v1"
+else:
+    CAPITAL_BASE_URL = "https://api-capital.backend-capital.com/api/v1"
+
+# ─── Telegram ─────────────────────────────────────────────────────────────────
+# اسم السرّ في هذا المستودع هو TELEGRAM_BOT_TOKEN (وهو ما يمرّره الـ workflow).
+# قراءة TELEGRAM_TOKEN وحده كانت ستُرجع نصاً فارغاً فيفشل الإرسال بصمت.
+TELEGRAM_TOKEN   = (os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("TELEGRAM_TOKEN", "")).strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# ─── الأدوات ──────────────────────────────────────────────────────────────────
+# الـ epics مطابقة لما يعمل فعلاً على هذا الحساب
+# (NASDAQ/DOW/SPX500 كانت تُرجع 404 — نستخدم US100/US30/US500)
+SYMBOLS = {
+    "US100":  {"epic": "US100",  "pip_size": 1.0,  "min_atr": 5.0},
+    "US30":   {"epic": "US30",   "pip_size": 1.0,  "min_atr": 8.0},
+    "US500":  {"epic": "US500",  "pip_size": 0.25, "min_atr": 1.5},
+    "XAUUSD": {"epic": "GOLD",   "pip_size": 0.1,  "min_atr": 1.0},  # الذهب
+}
+
+# الإطار الأساسي للدخول
+TIMEFRAME_ENTRY = "MINUTE_5"
+CANDLES_COUNT   = 100   # آخر 100 شمعة 5M — كافية لـ VWAP و EMA و RSI و ATR
+
+# ─── مؤشرات الاستراتيجية ─────────────────────────────────────────────────────
+EMA_FAST        = 9
+EMA_SLOW        = 21
+RSI_PERIOD      = 7       # فترة متوازنة — RSI-3 كان يقفز لـ 100/0 ويرفض إشارات صحيحة
+RSI_OVERSOLD    = 30
+RSI_OVERBOUGHT  = 70
+ATR_PERIOD      = 14
+ATR_SL_MULT     = 1.0     # Stop = 1× ATR
+ATR_TP_MULT     = 2.0     # Target = 2× ATR (RR = 1:2)
+
+# ─── إدارة المخاطرة ───────────────────────────────────────────────────────────
+RISK_PER_TRADE_PCT = 0.01
+MAX_OPEN_TRADES    = 2
+MAX_TRADES_PER_DAY = 6
+MAX_DAILY_LOSS_PCT = 0.02
+MAX_CONSEC_LOSSES  = 3
+
+# ─── جلسة التداول (UTC) ───────────────────────────────────────────────────────
+# جلسة نيويورك: 13:30-20:00 UTC = 17:30-24:00 دبي
+# نسمح من 13:00 لـ 20:30 UTC لتغطية أفضل
+SESSION_START_UTC = (13, 0)
+SESSION_END_UTC   = (20, 30)
+
+# ─── وضع التشغيل ──────────────────────────────────────────────────────────────
+BOT_MODE = os.getenv("BOT_MODE", "alert_only")
+
+# ─── الفحص ────────────────────────────────────────────────────────────────────
+SCAN_INTERVAL_SECONDS = 60
