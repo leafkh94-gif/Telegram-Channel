@@ -1,1 +1,1 @@
-web: python scalping_bot/main.py
+web: python vwap_bot/main.py
