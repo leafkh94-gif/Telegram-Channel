@@ -46,7 +46,7 @@ from datetime import datetime, timezone, timedelta
 
 from config import (
     SYMBOLS, TIMEFRAME_ENTRY, CANDLES_COUNT,
-    SCAN_INTERVAL_SECONDS, BOT_MODE
+    SCAN_INTERVAL_SECONDS, BOT_MODE, SYMBOL_COOLDOWN_MIN
 )
 from capital_client import CapitalClient
 from strategy       import scan
@@ -74,12 +74,14 @@ def is_weekend() -> bool:
 # الـ EMA مرتّبة و RSI فوق 50، تبقى الشروط صحيحة عشرات الشموع. مع فحص كل 60
 # ثانية وشمعة 5 دقائق، تُرسل نفس الإشارة ~145 مرة للحركة الواحدة (قياس فعلي).
 # هذا الحارس يرسل الإشارة مرة ثم يكتمها مدة تهدئة.
-_ALERT_COOLDOWN_MIN = 45
+# التهدئة لكل **أداة**، لا لكل (أداة+اتجاه). البصمة السابقة symbol:direction
+# كانت تجعل BUY و SELL بصمتين منفصلتين، فيمرّان معاً — وهكذا وصلت إشارتان
+# متعاكستان على نفس السوق خلال 8-13 دقيقة. الآن أي إشارة تكتم الأداة كلها.
 _recent_alerts: dict = {}
 
-def _is_duplicate(fp: str) -> bool:
-    t = _recent_alerts.get(fp)
-    return t is not None and (datetime.now(timezone.utc) - t) < timedelta(minutes=_ALERT_COOLDOWN_MIN)
+def _is_duplicate(symbol: str) -> bool:
+    t = _recent_alerts.get(symbol)
+    return t is not None and (datetime.now(timezone.utc) - t) < timedelta(minutes=SYMBOL_COOLDOWN_MIN)
 
 
 def scan_symbol(symbol: str, config: dict, client: CapitalClient, bot_mode: str,
@@ -105,12 +107,15 @@ def scan_symbol(symbol: str, config: dict, client: CapitalClient, bot_mode: str,
         logger.info(f"🚫 {reason}")
         return
 
-    # الاتجاه وحده كبصمة: السعر يتغيّر كل فحص، فلو بصمنا عليه لما عملت التهدئة.
-    fp = f"{symbol}:{signal.direction}"
-    if _is_duplicate(fp):
-        logger.info(f"🔁 {symbol} {signal.direction} — إشارة مكتومة (تهدئة)")
+    if _is_duplicate(symbol):
+        last = _recent_alerts[symbol]
+        mins = (datetime.now(timezone.utc) - last).total_seconds() / 60
+        logger.info(
+            f"🔁 {symbol} {signal.direction} — مكتومة "
+            f"(آخر إشارة قبل {mins:.0f}د، التهدئة {SYMBOL_COOLDOWN_MIN}د)"
+        )
         return
-    _recent_alerts[fp] = datetime.now(timezone.utc)
+    _recent_alerts[symbol] = datetime.now(timezone.utc)
 
     lot_size = calculate_lot_size(symbol, balance, signal.entry, signal.sl)
     msg = format_signal(signal, lot_size)
