@@ -33,10 +33,10 @@
     2. EMA:   السعر فوق EMA9 و EMA9 > EMA21 (شراء) | العكس (بيع)
     3. RSI:   RSI(3) ضمن النطاق الصحي (زخم بلا تشبع)
     4. ATR:   Stop = 1× ATR | Target = 2× ATR (RR 1:2)
-    5. الوقت: جلسة نيويورك فقط
+    5. الوقت: 24 ساعة الاثنين-الجمعة (فلتر ATR يتكفّل بالساعات الميتة)
 
 يعمل على: US100 | US30 | US500 | XAUUSD (الذهب)
-24 ساعة من الاثنين للجمعة | يتوقف السبت والأحد
+24 ساعة من الاثنين للجمعة | يتوقف السبت والأحد (لا قيد جلسة)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -46,7 +46,6 @@ from datetime import datetime, timezone, timedelta
 
 from config import (
     SYMBOLS, TIMEFRAME_ENTRY, CANDLES_COUNT,
-    SESSION_START_UTC, SESSION_END_UTC,
     SCAN_INTERVAL_SECONDS, BOT_MODE
 )
 from capital_client import CapitalClient
@@ -68,14 +67,6 @@ logger = logging.getLogger("MAIN")
 
 def is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
-
-
-def is_session_active() -> bool:
-    now = datetime.now(timezone.utc)
-    cur = now.hour * 60 + now.minute
-    start = SESSION_START_UTC[0] * 60 + SESSION_START_UTC[1]
-    end   = SESSION_END_UTC[0]   * 60 + SESSION_END_UTC[1]
-    return start <= cur <= end
 
 
 # ─── منع تكرار الإشارات ──────────────────────────────────────────────────────
@@ -144,7 +135,8 @@ def main():
         f"🤖 <b>بوت VWAP Scalping — يعمل</b>\n"
         f"الوضع: {BOT_MODE}\n"
         f"الأدوات: US100 · US30 · US500 · XAUUSD\n"
-        f"المنطق: VWAP + EMA + RSI + ATR"
+        f"المنطق: VWAP + EMA + RSI + ATR\n"
+        f"الجدول: الاثنين—الجمعة | 24 ساعة"
     )
 
     client    = CapitalClient()
@@ -161,11 +153,6 @@ def main():
             if is_weekend():
                 logger.info("🔴 عطلة نهاية الأسبوع")
                 time.sleep(300)
-                continue
-
-            if not is_session_active():
-                logger.info("💤 خارج جلسة نيويورك")
-                time.sleep(120)
                 continue
 
             candles_all: dict = {}
