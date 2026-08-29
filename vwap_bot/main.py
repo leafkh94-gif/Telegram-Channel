@@ -35,7 +35,7 @@
     4. ATR:   Stop = 1× ATR | Target = 2× ATR (RR 1:2)
     5. الوقت: 24 ساعة الاثنين-الجمعة (فلتر ATR يتكفّل بالساعات الميتة)
 
-يعمل على: US100 | US30 | XAUUSD (الذهب)
+يعمل على: US100 | US30 | US500 | XAUUSD (الذهب)
 24 ساعة من الاثنين للجمعة | يتوقف السبت والأحد (لا قيد جلسة)
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -52,7 +52,8 @@ from capital_client import CapitalClient
 from strategy       import scan
 from risk_manager   import can_trade, calculate_lot_size, record_trade_open, get_daily_stats
 from telegram_bot   import send_message, format_signal, process_commands
-from tracker        import log_signal, update_open_signals
+from tracker        import log_signal, update_open_signals, SIGNALS_CSV
+import state_store
 
 # استيراد محمي: لو تعذّر تحميل التقرير لأي سبب، يستمر البوت في عمله الأساسي
 try:
@@ -148,14 +149,22 @@ def main():
     send_message(
         f"🤖 <b>بوت VWAP Scalping — يعمل</b>\n"
         f"الوضع: {BOT_MODE}\n"
-        f"الأدوات: US100 · US30 · XAUUSD\n"
+        f"الأدوات: US100 · US30 · US500 · XAUUSD\n"
         f"المنطق: VWAP + EMA + RSI + ATR\n"
         f"الجدول: الاثنين—الجمعة | 24 ساعة"
     )
 
+    # نسحب سجل الإشارات المحفوظ قبل أي شيء: بدونه يبدأ كل تشغيل من الصفر
+    # فلا يرى التقرير اليومي إلا جزءاً من اليوم.
+    try:
+        state_store.pull(SIGNALS_CSV)
+    except Exception as e:
+        logger.error(f"❌ تعذّر سحب السجل: {e}")
+
     client    = CapitalClient()
     bot_state = {"mode": BOT_MODE, "paused": False, "offset": 0}
     last_report_date = None
+    last_push        = datetime.now(timezone.utc)
 
     while True:
         try:
@@ -191,6 +200,16 @@ def main():
                 update_open_signals(candles_all)
             except Exception as e:
                 logger.error(f"❌ خطأ متابعة الإشارات: {e}")
+
+            # رفع دوري للسجل: أي إلغاء للتشغيل لا يكلّفنا أكثر من آخر 5 دقائق
+            now_p = datetime.now(timezone.utc)
+            if (now_p - last_push).total_seconds() >= 300:
+                try:
+                    if state_store.push(SIGNALS_CSV):
+                        logger.info("📤 حُفظ سجل الإشارات خارجياً")
+                except Exception as e:
+                    logger.error(f"❌ تعذّر رفع السجل: {e}")
+                last_push = now_p
 
             logger.info(f"✅ دورة مكتملة — انتظار {SCAN_INTERVAL_SECONDS}s")
             time.sleep(SCAN_INTERVAL_SECONDS)
