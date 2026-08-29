@@ -14,9 +14,10 @@ on:
   workflow_dispatch:        # manual start / restart from the Actions tab
   schedule:
     # حارس تعافٍ فقط — السلسلة الذاتية (self-chain) هي الآلية الأساسية.
-    # كان كل ساعة؛ مع cancel-in-progress: true صار ذلك يعيد تشغيل البوت كل ساعة
-    # ويصفّر ذاكرة منع التكرار (dedup) فتتكرّر الإشارات. كل 6 ساعات يكفي للتعافي.
-    - cron: '17 */6 * * *'
+    # كان كل 6 ساعات، لكن مع cancel-in-progress: true كان كل إطلاق يقتل تشغيلاً
+    # **سليماً** في منتصف عمله (4 مرات يومياً) ويصفّر ذاكرة منع التكرار.
+    # مرة يومياً تكفي كشبكة أمان إذا انقطعت السلسلة، بأقل تعطيل ممكن.
+    - cron: '17 4 * * *'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # suppress Node.js 20 deprecation warnings
@@ -73,6 +74,9 @@ jobs:
           CAPITAL_IDENTIFIER:   ${{ secrets.CAPITAL_IDENTIFIER }}
           CAPITAL_PASSWORD:     ${{ secrets.CAPITAL_PASSWORD }}
           CAPITAL_DEMO:         "false"
+          # لحفظ سجل الإشارات على فرع status أثناء التشغيل (لا ينتظر نهاية الـ job)
+          GITHUB_TOKEN:         ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:    ${{ github.repository }}
           # Safety: deploy stays in alert_only. Real order execution requires
           # explicitly setting BOT_MODE=full_auto (spec: 30 paper setups first).
           BOT_MODE:             alert_only

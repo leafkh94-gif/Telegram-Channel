@@ -98,6 +98,13 @@ def log_signal(signal, symbol: str, lot: float) -> None:
     _write_all(rows)
     logger.info(f"📝 سُجّلت الإشارة {rows[-1]['id']} بحالة {rows[-1]['status']}")
 
+    # رفع فوري: الإشارة الجديدة أهم ما نخشى فقدانه لو أُلغي التشغيل الآن
+    try:
+        import state_store
+        state_store.push(SIGNALS_CSV, message=f"إشارة {rows[-1]['id']}")
+    except Exception as e:
+        logger.error(f"❌ تعذّر رفع السجل بعد الإشارة: {e}")
+
 
 # ─── متابعة الإشارات المفتوحة ─────────────────────────────────────────────────
 def update_open_signals(candles_by_symbol: dict[str, list[dict]]) -> None:

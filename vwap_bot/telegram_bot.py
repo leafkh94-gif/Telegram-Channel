@@ -70,8 +70,11 @@ def process_commands(bot_state: dict) -> dict:
         bot_state["offset"] = update["update_id"] + 1
         text = update.get("message", {}).get("text", "").strip().lower()
         if text in ("/report", "/تقرير"):
-            from tracker import build_report
-            send_message(build_report(days=1))
+            try:
+                from reporter import send_daily_report
+                send_daily_report()
+            except Exception:
+                send_message("⚠️ التقرير غير متاح حالياً")
             continue
 
         if text in ("/report7", "/week"):
