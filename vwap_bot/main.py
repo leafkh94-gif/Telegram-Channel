@@ -35,7 +35,7 @@
     4. ATR:   Stop = 1× ATR | Target = 2× ATR (RR 1:2)
     5. الوقت: 24 ساعة الاثنين-الجمعة (فلتر ATR يتكفّل بالساعات الميتة)
 
-يعمل على: US100 | US30 | US500 | XAUUSD (الذهب)
+يعمل على: US100 | US30 | XAUUSD (الذهب)
 24 ساعة من الاثنين للجمعة | يتوقف السبت والأحد (لا قيد جلسة)
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -53,6 +53,15 @@ from strategy       import scan
 from risk_manager   import can_trade, calculate_lot_size, record_trade_open, get_daily_stats
 from telegram_bot   import send_message, format_signal, process_commands
 from tracker        import log_signal, update_open_signals
+
+# استيراد محمي: لو تعذّر تحميل التقرير لأي سبب، يستمر البوت في عمله الأساسي
+try:
+    from reporter import send_daily_report
+    REPORTER_AVAILABLE = True
+except ImportError as e:
+    REPORTER_AVAILABLE = False
+    logging.getLogger("MAIN").error(f"⚠️ التقرير اليومي غير متاح: {e}")
+    def send_daily_report(*a, **k): pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -139,17 +148,28 @@ def main():
     send_message(
         f"🤖 <b>بوت VWAP Scalping — يعمل</b>\n"
         f"الوضع: {BOT_MODE}\n"
-        f"الأدوات: US100 · US30 · US500 · XAUUSD\n"
+        f"الأدوات: US100 · US30 · XAUUSD\n"
         f"المنطق: VWAP + EMA + RSI + ATR\n"
         f"الجدول: الاثنين—الجمعة | 24 ساعة"
     )
 
     client    = CapitalClient()
     bot_state = {"mode": BOT_MODE, "paused": False, "offset": 0}
+    last_report_date = None
 
     while True:
         try:
             bot_state = process_commands(bot_state)
+
+            # التقرير اليومي 21:00 UTC — مرة واحدة في اليوم.
+            # محاط بحماية: فشل التقرير يجب ألا يوقف البوت عن إرسال الإشارات.
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.hour == 21 and last_report_date != now_utc.date():
+                try:
+                    send_daily_report()
+                except Exception as e:
+                    logger.error(f"❌ خطأ التقرير (لا يؤثر على البوت): {e}")
+                last_report_date = now_utc.date()
 
             if bot_state["paused"]:
                 time.sleep(SCAN_INTERVAL_SECONDS)

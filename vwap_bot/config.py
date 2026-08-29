@@ -33,11 +33,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # ─── الأدوات ──────────────────────────────────────────────────────────────────
 # الـ epics مطابقة لما يعمل فعلاً على هذا الحساب
-# (NASDAQ/DOW/SPX500 كانت تُرجع 404 — نستخدم US100/US30/US500)
+# (NASDAQ/DOW/SPX500 كانت تُرجع 404 — نستخدم US100/US30)
+# US500 أُزيلت من الاستراتيجية بطلبكِ.
 SYMBOLS = {
     "US100":  {"epic": "US100",  "pip_size": 1.0,  "min_atr": 5.0},
     "US30":   {"epic": "US30",   "pip_size": 1.0,  "min_atr": 8.0},
-    "US500":  {"epic": "US500",  "pip_size": 0.25, "min_atr": 1.5},
     "XAUUSD": {"epic": "GOLD",   "pip_size": 0.1,  "min_atr": 1.0},  # الذهب
 }
 
