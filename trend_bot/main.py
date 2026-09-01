@@ -1,113 +1,144 @@
 """
-═══════════════════════════════════════════════════════════════════════════════
-                    بوت VWAP Scalping — النسخة النهائية v3
-═══════════════════════════════════════════════════════════════════════════════
+main.py — حلقة التشغيل: يومي ← 4 ساعات ← ساعة، شراء فقط
 
-⚠️⚠️⚠️  تعليمات للمبرمج — اقرأها أولاً قبل التشغيل  ⚠️⚠️⚠️
+قرارا تصميم يستحقّان الشرح:
 
-هذه النسخة تستبدل كل الاستراتيجيات القديمة بالكامل.
-يجب حذف الملفات التالية من المشروع قبل التشغيل:
+1. التقييم على إغلاق شمعة الساعة فقط.
+   الفحص كل دقيقة على شمعة قيد التكوّن يُنتج إشارات تظهر ثم تختفي، وهو ما
+   أغرقنا سابقاً. هنا نتصرّف فقط حين تُغلق شمعة ساعة جديدة، فيصير سلوك البوت
+   مطابقاً تماماً لما قِيس في الباك-تست.
 
-    ❌ احذف: strategy_1_sweep.py
-    ❌ احذف: strategy_2_news.py
-    ❌ احذف: strategy_3_sd.py
-    ❌ احذف: أي ملف قديم باسم indicators.py (استبدله بالجديد)
-    ❌ احذف: أي ملف قديم باسم config.py (استبدله بالجديد)
-
-الملفات الجديدة المطلوبة (فقط هذه):
-    ✅ config.py
-    ✅ indicators.py
-    ✅ strategy.py          ← الاستراتيجية الوحيدة الآن
-    ✅ capital_client.py
-    ✅ risk_manager.py
-    ✅ telegram_bot.py
-    ✅ main.py              ← هذا الملف
-
-أمر الحذف السريع (نفّذه في مجلد المشروع):
-    rm -f strategy_1_sweep.py strategy_2_news.py strategy_3_sd.py
-
-═══════════════════════════════════════════════════════════════════════════════
-
-منطق الاستراتيجية (مبني على بحث حقيقي — إجماع المصادر المحترفة):
-    1. VWAP:  السعر فوق = شراء فقط | تحت = بيع فقط
-    2. EMA:   السعر فوق EMA9 و EMA9 > EMA21 (شراء) | العكس (بيع)
-    3. RSI:   RSI(3) ضمن النطاق الصحي (زخم بلا تشبع)
-    4. ATR:   Stop = 1× ATR | Target = 2× ATR (RR 1:2)
-    5. الوقت: 24 ساعة الاثنين-الجمعة (فلتر ATR يتكفّل بالساعات الميتة)
-
-يعمل على: US100 | US30 | US500 | XAUUSD (الذهب)
-24 ساعة من الاثنين للجمعة | يتوقف السبت والأحد (لا قيد جلسة)
-═══════════════════════════════════════════════════════════════════════════════
+2. الصفقات المفتوحة تُعاد بناؤها من التاريخ لا تُحفظ.
+   المستودع عليه ruleset يمنع أي كتابة آلية، فلا يمكن حفظ الحالة بين
+   التشغيلات (تحقّقنا: كل رفع يُرفض). لكن الاستراتيجية حتميّة: نفس الشموع
+   تعطي نفس القرارات. فعند الإقلاع نُعيد تشغيل المنطق على آخر الشموع
+   ونستنتج الصفقة القائمة. لا حالة تُفقد بإعادة التشغيل، ولا حاجة لتخزين.
 """
 
-import time
 import logging
-from datetime import datetime, timezone, timedelta
+import time
+from datetime import datetime, timezone
 
 from config import (
-    SYMBOLS, TIMEFRAME_ENTRY, CANDLES_COUNT,
-    SCAN_INTERVAL_SECONDS, BOT_MODE, SYMBOL_COOLDOWN_MIN
+    SYMBOLS, BOT_MODE, SCAN_INTERVAL_SECONDS,
+    TIMEFRAME_DAILY, TIMEFRAME_H4, TIMEFRAME_H1, TIMEFRAME_M5,
+    CANDLES_DAILY, CANDLES_H4, CANDLES_H1, CANDLES_M5,
+    STOP_ATR, TRAIL_ATR,
 )
 from capital_client import CapitalClient
-from strategy       import scan
-from risk_manager   import can_trade, calculate_lot_size, record_trade_open, get_daily_stats
-from telegram_bot   import send_message, format_signal, process_commands
-from tracker        import log_signal, update_open_signals, SIGNALS_CSV
-import state_store
-
-# استيراد محمي: لو تعذّر تحميل التقرير لأي سبب، يستمر البوت في عمله الأساسي
-try:
-    from reporter import send_daily_report
-    REPORTER_AVAILABLE = True
-except ImportError as e:
-    REPORTER_AVAILABLE = False
-    logging.getLogger("MAIN").error(f"⚠️ التقرير اليومي غير متاح: {e}")
-    def send_daily_report(*a, **k): pass
+import strategy
+from position import Position, open_position, update, risk_unit
+from risk_manager import can_trade, calculate_lot_size
+from telegram_bot import (
+    send_message, format_entry, format_trail, format_exit, process_commands,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ]
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")],
 )
 logger = logging.getLogger("MAIN")
+
+# آخر شمعة ساعة عولجت لكل أداة — يمنع تكرار المعالجة داخل الساعة الواحدة
+_last_bar: dict[str, str] = {}
+# الصفقات القائمة، مُعاد بناؤها عند الإقلاع
+_positions: dict[str, Position] = {}
+# آخر وقف أُبلغ عنه، حتى لا نُرسل تحديثاً على كل ارتفاع تافه
+_last_trail: dict[str, float] = {}
+
+TRAIL_ALERT_PCT = 0.25   # نُبلغ حين يرتفع الوقف ≥ ربع المخاطرة الأولية
 
 
 def is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
 
 
-# ─── منع تكرار الإشارات ──────────────────────────────────────────────────────
-# شروط هذه الاستراتيجية حالة مستمرة، لا حدثاً لحظياً: طالما السعر فوق VWAP و
-# الـ EMA مرتّبة و RSI فوق 50، تبقى الشروط صحيحة عشرات الشموع. مع فحص كل 60
-# ثانية وشمعة 5 دقائق، تُرسل نفس الإشارة ~145 مرة للحركة الواحدة (قياس فعلي).
-# هذا الحارس يرسل الإشارة مرة ثم يكتمها مدة تهدئة.
-# التهدئة لكل **أداة**، لا لكل (أداة+اتجاه). البصمة السابقة symbol:direction
-# كانت تجعل BUY و SELL بصمتين منفصلتين، فيمرّان معاً — وهكذا وصلت إشارتان
-# متعاكستان على نفس السوق خلال 8-13 دقيقة. الآن أي إشارة تكتم الأداة كلها.
-_recent_alerts: dict = {}
-
-def _is_duplicate(symbol: str) -> bool:
-    t = _recent_alerts.get(symbol)
-    return t is not None and (datetime.now(timezone.utc) - t) < timedelta(minutes=SYMBOL_COOLDOWN_MIN)
+def _closed(candles: list[dict]) -> list[dict]:
+    """يُسقط الشمعة الجارية. التقييم على شمعة غير مكتملة يُنتج إشارات زائلة."""
+    return candles[:-1] if len(candles) > 1 else candles
 
 
-def scan_symbol(symbol: str, config: dict, client: CapitalClient, bot_mode: str,
-                candles_out: dict | None = None):
-    epic = config["epic"]
+def _fetch(client: CapitalClient, epic: str) -> tuple | None:
+    d  = _closed(client.get_candles(epic, TIMEFRAME_DAILY, CANDLES_DAILY))
+    h4 = _closed(client.get_candles(epic, TIMEFRAME_H4,    CANDLES_H4))
+    h1 = _closed(client.get_candles(epic, TIMEFRAME_H1,    CANDLES_H1))
+    m5 = client.get_candles(epic, TIMEFRAME_M5, CANDLES_M5)   # السعر الحيّ مطلوب هنا
+    if not d or not h4 or not h1:
+        return None
+    return d, h4, h1, m5
 
-    candles = client.get_candles(epic, TIMEFRAME_ENTRY, CANDLES_COUNT)
-    if not candles:
-        logger.warning(f"⚠️ {symbol}: لا بيانات")
+
+def _coarse_index(fine: list[dict], coarse: list[dict]) -> list[int]:
+    out, j = [], -1
+    ct = [c["time"] for c in coarse]
+    for c in fine:
+        while j + 1 < len(ct) and ct[j + 1] < c["time"]:
+            j += 1
+        out.append(j - 1)
+    return out
+
+
+def rebuild_position(symbol: str, d: list[dict], h4: list[dict],
+                     h1: list[dict]) -> Position | None:
+    """
+    يُعيد اشتقاق الصفقة القائمة بتشغيل نفس المنطق على التاريخ المتاح.
+    يستدعي strategy.scan و position.update — أي نفس دوال الباك-تست والتشغيل.
+    """
+    i4, idd = _coarse_index(h1, h4), _coarse_index(h1, d)
+    pos = None
+    for i in range(80, len(h1)):
+        bar = h1[i]
+        if pos is not None:
+            pos, ex = update(pos, bar)
+            if ex:
+                pos = None
+            continue
+        di, fi = idd[i], i4[i]
+        if di < 25 or fi < 25:
+            continue
+        sig = strategy.scan(symbol, d[:di + 1], h4[:fi + 1], h1[:i + 1], [bar])
+        if sig:
+            pos = open_position(symbol, sig.entry, sig.atr, bar["time"])
+    return pos
+
+
+def scan_symbol(symbol: str, cfg: dict, client: CapitalClient, mode: str) -> None:
+    data = _fetch(client, cfg["epic"])
+    if not data:
+        logger.warning(f"⚠️ بيانات ناقصة: {symbol}")
+        return
+    d, h4, h1, m5 = data
+
+    bar = h1[-1]
+    if _last_bar.get(symbol) == bar["time"]:
+        return                                   # لا شمعة ساعة جديدة بعد
+    _last_bar[symbol] = bar["time"]
+    logger.info(f"🕐 {symbol}: شمعة ساعة جديدة {bar['time']} | إغلاق {bar['close']:.2f}")
+
+    pos = _positions.get(symbol)
+
+    # ── إدارة صفقة قائمة
+    if pos is not None:
+        before = pos.stop
+        pos, ex = update(pos, bar)
+        if ex:
+            _positions.pop(symbol, None)
+            _last_trail.pop(symbol, None)
+            send_message(format_exit(symbol, pos, ex))
+            logger.info(f"🚪 {symbol} خروج {ex.reason} @ {ex.price:.2f} | {ex.r:+.2f}R")
+            return
+        _positions[symbol] = pos
+        moved = pos.stop - _last_trail.get(symbol, before)
+        if moved >= TRAIL_ALERT_PCT * risk_unit(pos):
+            _last_trail[symbol] = pos.stop
+            send_message(format_trail(symbol, pos))
+            logger.info(f"🔒 {symbol} الوقف ارتفع إلى {pos.stop:.2f}")
         return
 
-    if candles_out is not None:
-        candles_out[symbol] = candles
-
-    signal = scan(symbol, candles)
-    if signal is None:
+    # ── البحث عن دخول جديد
+    sig = strategy.scan(symbol, d, h4, h1, m5)
+    if not sig:
         return
 
     balance  = client.get_account_balance()
@@ -117,103 +148,56 @@ def scan_symbol(symbol: str, config: dict, client: CapitalClient, bot_mode: str,
         logger.info(f"🚫 {reason}")
         return
 
-    if _is_duplicate(symbol):
-        last = _recent_alerts[symbol]
-        mins = (datetime.now(timezone.utc) - last).total_seconds() / 60
-        logger.info(
-            f"🔁 {symbol} {signal.direction} — مكتومة "
-            f"(آخر إشارة قبل {mins:.0f}د، التهدئة {SYMBOL_COOLDOWN_MIN}د)"
-        )
-        return
-    _recent_alerts[symbol] = datetime.now(timezone.utc)
-
-    lot_size = calculate_lot_size(symbol, balance, signal.entry, signal.sl)
-    msg = format_signal(signal, lot_size)
-    log_signal(signal, symbol, lot_size)
-
-    if bot_mode == "alert_only":
-        send_message(msg)
-        logger.info(f"📤 إشارة أُرسلت: {symbol} {signal.direction}")
-    elif bot_mode == "full_auto":
-        send_message(msg)
-        result = client.place_order(
-            epic=epic, direction=signal.direction, size=lot_size,
-            stop_level=signal.sl, profit_level=signal.tp
-        )
-        if result:
-            record_trade_open()
+    lot = calculate_lot_size(symbol, balance, sig.entry, sig.sl)
+    _positions[symbol]  = open_position(symbol, sig.entry, sig.atr, bar["time"])
+    _last_trail[symbol] = _positions[symbol].stop
+    send_message(format_entry(sig, lot))
+    logger.info(f"📤 إشارة دخول: {symbol} @ {sig.entry:.2f} وقف {sig.sl:.2f}")
 
 
-def main():
-    logger.info("🚀 بوت VWAP Scalping v3 — بدء")
+def main() -> None:
+    logger.info("🚀 بوت الاتجاه — يومي/4س/ساعة، شراء فقط")
+    client = CapitalClient()
+
+    # إعادة بناء الصفقات القائمة قبل أي قرار جديد
+    restored = 0
+    for symbol, cfg in SYMBOLS.items():
+        try:
+            data = _fetch(client, cfg["epic"])
+            if not data:
+                continue
+            d, h4, h1, _ = data
+            _last_bar[symbol] = h1[-1]["time"]
+            p = rebuild_position(symbol, d, h4, h1)
+            if p:
+                _positions[symbol]  = p
+                _last_trail[symbol] = p.stop
+                restored += 1
+                logger.info(f"♻️ {symbol}: صفقة قائمة دخول {p.entry:.2f} وقف {p.stop:.2f}")
+        except Exception as e:
+            logger.error(f"❌ إعادة بناء {symbol}: {e}")
+
     send_message(
-        f"🤖 <b>بوت VWAP Scalping — يعمل</b>\n"
+        f"🤖 <b>بوت الاتجاه — يعمل</b>\n"
         f"الوضع: {BOT_MODE}\n"
-        f"الأدوات: US100 · US30 · US500 · XAUUSD\n"
-        f"المنطق: VWAP + EMA + RSI + ATR\n"
-        f"الجدول: الاثنين—الجمعة | 24 ساعة"
+        f"المنطق: يومي ← 4 ساعات ← ساعة | شراء فقط\n"
+        f"الوقف: {STOP_ATR}×ATR | المتحرّك: {TRAIL_ATR}×ATR\n"
+        f"صفقات قائمة: {restored}"
     )
 
-    # نسحب سجل الإشارات المحفوظ قبل أي شيء: بدونه يبدأ كل تشغيل من الصفر
-    # فلا يرى التقرير اليومي إلا جزءاً من اليوم.
-    try:
-        state_store.pull(SIGNALS_CSV)
-    except Exception as e:
-        logger.error(f"❌ تعذّر سحب السجل: {e}")
-
-    client    = CapitalClient()
-    bot_state = {"mode": BOT_MODE, "paused": False, "offset": 0}
-    last_report_date = None
-    last_push        = datetime.now(timezone.utc)
-
+    state = {"mode": BOT_MODE, "paused": False, "offset": 0}
     while True:
         try:
-            bot_state = process_commands(bot_state)
-
-            # التقرير اليومي 21:00 UTC — مرة واحدة في اليوم.
-            # محاط بحماية: فشل التقرير يجب ألا يوقف البوت عن إرسال الإشارات.
-            now_utc = datetime.now(timezone.utc)
-            if now_utc.hour == 21 and last_report_date != now_utc.date():
-                try:
-                    send_daily_report()
-                except Exception as e:
-                    logger.error(f"❌ خطأ التقرير (لا يؤثر على البوت): {e}")
-                last_report_date = now_utc.date()
-
-            if bot_state["paused"]:
-                time.sleep(SCAN_INTERVAL_SECONDS)
+            state = process_commands(state)
+            if state["paused"] or is_weekend():
+                time.sleep(300 if is_weekend() else SCAN_INTERVAL_SECONDS)
                 continue
-
-            if is_weekend():
-                logger.info("🔴 عطلة نهاية الأسبوع")
-                time.sleep(300)
-                continue
-
-            candles_all: dict = {}
-            for symbol, config in SYMBOLS.items():
+            for symbol, cfg in SYMBOLS.items():
                 try:
-                    scan_symbol(symbol, config, client, bot_state["mode"], candles_all)
+                    scan_symbol(symbol, cfg, client, state["mode"])
                 except Exception as e:
-                    logger.error(f"❌ خطأ {symbol}: {e}")
-
-            try:
-                update_open_signals(candles_all)
-            except Exception as e:
-                logger.error(f"❌ خطأ متابعة الإشارات: {e}")
-
-            # رفع دوري للسجل: أي إلغاء للتشغيل لا يكلّفنا أكثر من آخر 5 دقائق
-            now_p = datetime.now(timezone.utc)
-            if (now_p - last_push).total_seconds() >= 300:
-                try:
-                    if state_store.push(SIGNALS_CSV):
-                        logger.info("📤 حُفظ سجل الإشارات خارجياً")
-                except Exception as e:
-                    logger.error(f"❌ تعذّر رفع السجل: {e}")
-                last_push = now_p
-
-            logger.info(f"✅ دورة مكتملة — انتظار {SCAN_INTERVAL_SECONDS}s")
+                    logger.error(f"❌ {symbol}: {e}")
             time.sleep(SCAN_INTERVAL_SECONDS)
-
         except KeyboardInterrupt:
             send_message("🛑 البوت أُوقف يدوياً")
             break

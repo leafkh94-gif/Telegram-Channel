@@ -50,7 +50,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r vwap_bot/requirements.txt
+        run: pip install -r trend_bot/requirements.txt
 
       - name: Restore agent state
         uses: actions/cache@v4
@@ -65,7 +65,7 @@ jobs:
       - name: Run alert bot (continuous, ~5h40m then clean handoff)
         run: |
           start=$(date +%s)
-          timeout 20400 python vwap_bot/main.py || true
+          timeout 20400 python trend_bot/main.py || true
           echo "RUN_ELAPSED=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}

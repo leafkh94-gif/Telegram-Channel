@@ -24,22 +24,45 @@ def send_message(text: str) -> bool:
         return False
 
 
-def format_signal(signal, lot_size: float) -> str:
-    arrow = "🟢 شراء" if signal.direction == "BUY" else "🔴 بيع"
+def format_entry(sig, lot: float) -> str:
+    risk = sig.entry - sig.sl
     return (
-        f"🔔 <b>إشارة VWAP — {signal.symbol}</b>\n"
+        f"🟢 <b>دخول شراء — {sig.symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"الاتجاه : <b>{arrow}</b>\n"
+        f"الدخول    : <code>{sig.entry}</code>\n"
+        f"الوقف     : <code>{sig.sl}</code>  ({risk:.1f} نقطة)\n"
+        f"الحجم     : <code>{lot}</code> لوت\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"الدخول  : <code>{signal.entry}</code>\n"
-        f"SL      : <code>{signal.sl}</code>\n"
-        f"TP      : <code>{signal.tp}</code>  (RR {signal.rr}:1)\n"
-        f"الحجم   : <code>{lot_size}</code> لوت\n"
+        f"<b>لا يوجد هدف ثابت.</b>\n"
+        f"الوقف يتحرّك خلف السعر بـ {sig.trail_atr}×ATR،\n"
+        f"والصفقة تُغلق حين يُضرب — وسأخبرك بذلك.\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"VWAP    : <code>{signal.vwap}</code>\n"
-        f"EMA 9/21: {signal.ema_fast} / {signal.ema_slow}\n"
-        f"RSI     : {signal.rsi}\n"
-        f"ATR     : {signal.atr}\n"
+        f"اليومي  : {sig.daily_close} فوق EMA {sig.daily_ema} ✓\n"
+        f"الاختراق: قناة {sig.channel_high}\n"
+        f"ATR ساعة: {sig.atr}"
+    )
+
+
+def format_trail(symbol: str, pos) -> str:
+    locked = pos.stop - pos.entry
+    state = ("🔒 <b>الوقف فوق الدخول — الصفقة مؤمّنة</b>" if locked > 0
+             else "الوقف ما زال تحت الدخول")
+    return (
+        f"🔺 <b>تحديث وقف — {symbol}</b>\n"
+        f"الوقف الجديد: <code>{pos.stop:.2f}</code>\n"
+        f"الدخول كان : <code>{pos.entry:.2f}</code>\n"
+        f"{state}"
+    )
+
+
+def format_exit(symbol: str, pos, ex) -> str:
+    return (
+        f"{'✅' if ex.r > 0 else '❌'} <b>خروج — {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"الدخول : <code>{pos.entry:.2f}</code>\n"
+        f"الخروج : <code>{ex.price:.2f}</code>\n"
+        f"النتيجة: <b>{ex.r:+.2f}R</b>\n"
+        f"السبب  : {'الوقف المتحرّك' if ex.reason == 'SL' else 'انتهاء المدة'}"
     )
 
 
