@@ -44,7 +44,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r vwap_bot/requirements.txt
+        run: pip install -r trend_bot/requirements.txt
 
       - name: Fetch history
         run: |
