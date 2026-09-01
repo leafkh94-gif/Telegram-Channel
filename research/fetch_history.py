@@ -38,6 +38,7 @@ logger = logging.getLogger("HISTORY")
 # دقائق، وكتابة الاثنين على نفس المرجع تتسابق فيرجع 409 Conflict — وهذا بالضبط
 # ما أفشل أول تشغيل بعد أن كان السحب نفسه ناجحاً بالكامل.
 BRANCH = "data"
+FALLBACK_BRANCH = "status"
 API    = "https://api.github.com"
 
 # Capital.com يحدّ عدد الشموع في الطلب الواحد، فنقسّم المدى إلى نوافذ ونصل بينها.
@@ -123,30 +124,58 @@ def _headers(token: str) -> dict:
             "X-GitHub-Api-Version": "2022-11-28"}
 
 
-def ensure_branch(token: str, repo: str) -> bool:
-    """ينشئ فرع البيانات من الفرع الافتراضي إن لم يكن موجوداً."""
+def ensure_branch(token: str, repo: str) -> str | None:
+    """
+    يجهّز فرعاً للبيانات ويُعيد اسمه، أو None إن تعذّر كل شيء.
+
+    يحاول إنشاء BRANCH؛ وإن فشل الإنشاء يرجع إلى FALLBACK_BRANCH الموجود سلفاً
+    بدل إسقاط التشغيل كله. سحب الشموع يستغرق دقائق ونجح فعلاً في المرتين
+    السابقتين — إسقاطه بسبب تعذّر إنشاء فرع هو أسوأ مقايضة ممكنة. سباق الكتابة
+    الذي دفعنا لفرع منفصل تكفّلت به إعادة المحاولة في push().
+    """
     h = _headers(token)
+
+    def exists(branch: str) -> bool:
+        try:
+            return requests.get(f"{API}/repos/{repo}/git/ref/heads/{branch}",
+                                headers=h, timeout=20).ok
+        except Exception:
+            return False
+
+    if exists(BRANCH):
+        return BRANCH
+
     try:
-        r = requests.get(f"{API}/repos/{repo}/git/ref/heads/{BRANCH}", headers=h, timeout=20)
-        if r.ok:
-            return True
         base = requests.get(f"{API}/repos/{repo}", headers=h, timeout=20)
         base.raise_for_status()
         default = base.json().get("default_branch", "main")
-        head = requests.get(f"{API}/repos/{repo}/git/ref/heads/{default}", headers=h, timeout=20)
+        head = requests.get(f"{API}/repos/{repo}/git/ref/heads/{default}",
+                            headers=h, timeout=20)
         head.raise_for_status()
         sha = head.json()["object"]["sha"]
+        logger.info(f"محاولة إنشاء {BRANCH} من {default} @ {sha[:8]}")
         c = requests.post(f"{API}/repos/{repo}/git/refs", headers=h, timeout=20,
                           json={"ref": f"refs/heads/{BRANCH}", "sha": sha})
-        c.raise_for_status()
-        logger.info(f"🌱 أُنشئ فرع {BRANCH}")
-        return True
+        if c.ok:
+            logger.info(f"🌱 أُنشئ فرع {BRANCH}")
+            return BRANCH
+        # نص الرد هو ما يقول السبب فعلاً — رمز الحالة وحده لا يكفي، وهذا ما
+        # أعمانا في التشغيل السابق (422 بلا تفسير).
+        logger.error(f"❌ تعذّر إنشاء {BRANCH}: {c.status_code} — {c.text[:300]}")
     except Exception as e:
-        logger.error(f"❌ تعذّر تجهيز فرع {BRANCH}: {e}")
-        return False
+        logger.error(f"❌ تعذّر إنشاء {BRANCH}: {e}")
+
+    if exists(FALLBACK_BRANCH):
+        logger.warning(f"↩️ نكتب على فرع {FALLBACK_BRANCH} بدلاً منه "
+                       f"(إعادة المحاولة تتكفّل بأي تعارض)")
+        return FALLBACK_BRANCH
+
+    logger.error("❌ لا فرع صالح للكتابة")
+    return None
 
 
-def push(path: str, content: str, token: str, repo: str, attempts: int = 5) -> bool:
+def push(path: str, content: str, token: str, repo: str,
+         branch: str = BRANCH, attempts: int = 5) -> bool:
     """
     يرفع الملف مع إعادة محاولة عند التعارض.
 
@@ -157,11 +186,11 @@ def push(path: str, content: str, token: str, repo: str, attempts: int = 5) -> b
     for i in range(attempts):
         try:
             g = requests.get(f"{API}/repos/{repo}/contents/{path}",
-                             headers=h, params={"ref": BRANCH}, timeout=20)
+                             headers=h, params={"ref": branch}, timeout=20)
             sha = g.json().get("sha") if g.ok else None
             body = {"message": f"بيانات تاريخية: {path}",
                     "content": base64.b64encode(content.encode()).decode(),
-                    "branch": BRANCH}
+                    "branch": branch}
             if sha:
                 body["sha"] = sha
             r = requests.put(f"{API}/repos/{repo}/contents/{path}",
@@ -197,9 +226,12 @@ def main() -> int:
     token  = (os.getenv("GITHUB_TOKEN", "") or "").strip()
     repo   = (os.getenv("GITHUB_REPOSITORY", "") or "").strip()
 
-    if token and repo and not ensure_branch(token, repo):
-        logger.error("❌ لا يمكن المتابعة بلا فرع بيانات")
-        return 1
+    branch = None
+    if token and repo:
+        branch = ensure_branch(token, repo)
+        if branch is None:
+            logger.error("❌ لا يمكن المتابعة بلا فرع للكتابة")
+            return 1
 
     ok = True
     for symbol, cfg in SYMBOLS.items():
@@ -213,7 +245,7 @@ def main() -> int:
                     f"{rows[0]['time']} → {rows[-1]['time']}")
         path = f"data/{symbol}_{args.resolution}.csv"
         if token and repo:
-            if push(path, to_csv(rows), token, repo):
+            if push(path, to_csv(rows), token, repo, branch):
                 logger.info(f"📤 رُفع {path}")
             else:
                 ok = False
