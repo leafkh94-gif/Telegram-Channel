@@ -1,0 +1,60 @@
+name: Fetch Historical Data
+
+# يسحب شموعاً تاريخية حقيقية من Capital.com ويحفظها على فرع status.
+#
+# سبب وجوده: كل قياس أجريناه حتى الآن جاء من عيّنات لوقز يومين فقط، وكلاهما يوم
+# تذبذب. أي استراتيجية تُعاير على هذا الحجم تلائم الضجيج لا السوق. هذا الـ
+# workflow يبني قاعدة بيانات حقيقية نختبر عليها الأفكار داخل العيّنة وخارجها.
+#
+# يُشغَّل يدوياً فقط — ليس جزءاً من تشغيل البوت، ولا يؤثر عليه.
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'كم يوماً للخلف'
+        required: false
+        default: '30'
+      resolution:
+        description: 'الإطار الزمني (MINUTE_5 / MINUTE_15 / HOUR)'
+        required: false
+        default: 'MINUTE_5'
+
+permissions:
+  contents: write     # لرفع البيانات إلى فرع status
+
+# مجموعة منفصلة عن البوت: سحب البيانات يجب ألا يلغي تشغيل البوت ولا العكس.
+concurrency:
+  group: fetch-history
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r vwap_bot/requirements.txt
+
+      - name: Fetch history
+        run: |
+          python research/fetch_history.py \
+            --days "${{ github.event.inputs.days || '30' }}" \
+            --resolution "${{ github.event.inputs.resolution || 'MINUTE_5' }}"
+        env:
+          CAPITAL_API_KEY:    ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
+          CAPITAL_PASSWORD:   ${{ secrets.CAPITAL_PASSWORD }}
+          CAPITAL_DEMO:       "false"
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
