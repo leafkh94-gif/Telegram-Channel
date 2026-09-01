@@ -34,7 +34,10 @@ from capital_client import CapitalClient      # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("HISTORY")
 
-BRANCH = "status"
+# فرع منفصل عن status عمداً: البوت يرفع signals_log.csv إلى status كل خمس
+# دقائق، وكتابة الاثنين على نفس المرجع تتسابق فيرجع 409 Conflict — وهذا بالضبط
+# ما أفشل أول تشغيل بعد أن كان السحب نفسه ناجحاً بالكامل.
+BRANCH = "data"
 API    = "https://api.github.com"
 
 # Capital.com يحدّ عدد الشموع في الطلب الواحد، فنقسّم المدى إلى نوافذ ونصل بينها.
@@ -114,27 +117,70 @@ def to_csv(rows: list[dict]) -> str:
     return buf.getvalue()
 
 
-def push(path: str, content: str, token: str, repo: str) -> bool:
-    """يرفع الملف إلى فرع البيانات عبر Contents API."""
-    h = {"Authorization": f"Bearer {token}",
-         "Accept": "application/vnd.github+json",
-         "X-GitHub-Api-Version": "2022-11-28"}
+def _headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def ensure_branch(token: str, repo: str) -> bool:
+    """ينشئ فرع البيانات من الفرع الافتراضي إن لم يكن موجوداً."""
+    h = _headers(token)
     try:
-        g = requests.get(f"{API}/repos/{repo}/contents/{path}",
-                         headers=h, params={"ref": BRANCH}, timeout=20)
-        sha = g.json().get("sha") if g.ok else None
-        body = {"message": f"بيانات تاريخية: {path}",
-                "content": base64.b64encode(content.encode()).decode(),
-                "branch": BRANCH}
-        if sha:
-            body["sha"] = sha
-        r = requests.put(f"{API}/repos/{repo}/contents/{path}",
-                         headers=h, json=body, timeout=60)
-        r.raise_for_status()
+        r = requests.get(f"{API}/repos/{repo}/git/ref/heads/{BRANCH}", headers=h, timeout=20)
+        if r.ok:
+            return True
+        base = requests.get(f"{API}/repos/{repo}", headers=h, timeout=20)
+        base.raise_for_status()
+        default = base.json().get("default_branch", "main")
+        head = requests.get(f"{API}/repos/{repo}/git/ref/heads/{default}", headers=h, timeout=20)
+        head.raise_for_status()
+        sha = head.json()["object"]["sha"]
+        c = requests.post(f"{API}/repos/{repo}/git/refs", headers=h, timeout=20,
+                          json={"ref": f"refs/heads/{BRANCH}", "sha": sha})
+        c.raise_for_status()
+        logger.info(f"🌱 أُنشئ فرع {BRANCH}")
         return True
     except Exception as e:
-        logger.error(f"❌ تعذّر رفع {path}: {e}")
+        logger.error(f"❌ تعذّر تجهيز فرع {BRANCH}: {e}")
         return False
+
+
+def push(path: str, content: str, token: str, repo: str, attempts: int = 5) -> bool:
+    """
+    يرفع الملف مع إعادة محاولة عند التعارض.
+
+    الرفع المتتالي لعدة ملفات يحرّك رأس الفرع في كل مرة، فقد يصير الـ sha الذي
+    قرأناه قديماً قبل أن نكتب. عند 409/422 نُحدّث المرجع ونعيد مع تراجع تصاعدي.
+    """
+    h = _headers(token)
+    for i in range(attempts):
+        try:
+            g = requests.get(f"{API}/repos/{repo}/contents/{path}",
+                             headers=h, params={"ref": BRANCH}, timeout=20)
+            sha = g.json().get("sha") if g.ok else None
+            body = {"message": f"بيانات تاريخية: {path}",
+                    "content": base64.b64encode(content.encode()).decode(),
+                    "branch": BRANCH}
+            if sha:
+                body["sha"] = sha
+            r = requests.put(f"{API}/repos/{repo}/contents/{path}",
+                             headers=h, json=body, timeout=60)
+            if r.status_code in (409, 422):
+                wait = 2 ** i
+                logger.warning(f"↻ تعارض على {path} — إعادة بعد {wait}s "
+                               f"(محاولة {i + 1}/{attempts})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"❌ تعذّر رفع {path}: {e}")
+            if i == attempts - 1:
+                return False
+            time.sleep(2 ** i)
+    logger.error(f"❌ فشل رفع {path} بعد {attempts} محاولات")
+    return False
 
 
 def main() -> int:
@@ -150,6 +196,10 @@ def main() -> int:
     client = CapitalClient()
     token  = (os.getenv("GITHUB_TOKEN", "") or "").strip()
     repo   = (os.getenv("GITHUB_REPOSITORY", "") or "").strip()
+
+    if token and repo and not ensure_branch(token, repo):
+        logger.error("❌ لا يمكن المتابعة بلا فرع بيانات")
+        return 1
 
     ok = True
     for symbol, cfg in SYMBOLS.items():
