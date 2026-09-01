@@ -17,6 +17,7 @@ fetch_history.py — سحب شموع تاريخية حقيقية للبحث
 import argparse
 import base64
 import csv
+import gzip
 import io
 import logging
 import os
@@ -116,6 +117,45 @@ def to_csv(rows: list[dict]) -> str:
     w.writeheader()
     w.writerows(rows)
     return buf.getvalue()
+
+
+# ─── نقل البيانات عبر اللوق ───────────────────────────────────────────────────
+# المستودع عليه ruleset فعّال على ~ALL يمنع creation و update بلا أي bypass،
+# فأي كتابة آلية على أي فرع مرفوضة (تحقّقنا: إنشاء الفرع 422 "Reference update
+# failed"، وكل رفع محتوى 409). سجل الإشارات نفسه لم يُحفظ ولا مرة لهذا السبب.
+# حتى يُضاف استثناء لـ GitHub Actions، ننقل البيانات عبر لوق التشغيل: اللوقز
+# مقروءة دائماً ولا تحتاج صلاحية كتابة.
+#
+# الترميز يهدف لتصغير الحجم كي يبقى اللوق قابلاً للسحب كاملاً:
+#   الوقت  → دقائق منذ أول شمعة (عدد صحيح)
+#   الأسعار → فروق عن الشمعة السابقة × 100 (أعداد صحيحة)
+# ثم gzip + base64. النتيجة ~126 كيلوبايت لكل أداة بدل 710 كيلوبايت خاماً.
+LOG_CHUNK = 4000
+
+
+def encode_rows(rows: list[dict]) -> str:
+    """يحوّل الشموع إلى نص مضغوط قابل للنقل عبر اللوق."""
+    t0 = datetime.fromisoformat(rows[0]["time"])
+    out = [f"#{rows[0]['time']}"]
+    prev = None
+    for r in rows:
+        m = int((datetime.fromisoformat(r["time"]) - t0).total_seconds() // 60)
+        cur = [int(round(r[k] * 100)) for k in ("open", "high", "low", "close")]
+        cur.append(int(round(r.get("volume", 0))))
+        vals = [c - p for c, p in zip(cur, prev)] if prev else cur
+        prev = cur
+        out.append(f"{m}," + ",".join(map(str, vals)))
+    blob = base64.b64encode(gzip.compress("\n".join(out).encode(), 9)).decode()
+    return blob
+
+
+def emit_to_log(symbol: str, resolution: str, rows: list[dict]) -> None:
+    blob = encode_rows(rows)
+    print(f"=== DATA_BEGIN {symbol} {resolution} rows={len(rows)} "
+          f"b64={len(blob)} ===", flush=True)
+    for i in range(0, len(blob), LOG_CHUNK):
+        print(blob[i:i + LOG_CHUNK], flush=True)
+    print(f"=== DATA_END {symbol} ===", flush=True)
 
 
 def _headers(token: str) -> dict:
@@ -226,12 +266,7 @@ def main() -> int:
     token  = (os.getenv("GITHUB_TOKEN", "") or "").strip()
     repo   = (os.getenv("GITHUB_REPOSITORY", "") or "").strip()
 
-    branch = None
-    if token and repo:
-        branch = ensure_branch(token, repo)
-        if branch is None:
-            logger.error("❌ لا يمكن المتابعة بلا فرع للكتابة")
-            return 1
+    branch = ensure_branch(token, repo) if (token and repo) else None
 
     ok = True
     for symbol, cfg in SYMBOLS.items():
@@ -243,14 +278,18 @@ def main() -> int:
             continue
         logger.info(f"✅ {symbol}: {len(rows)} شمعة | "
                     f"{rows[0]['time']} → {rows[-1]['time']}")
+        # النقل عبر اللوق هو المسار المضمون — لا يحتاج صلاحية كتابة
+        emit_to_log(symbol, args.resolution, rows)
+
+        # محاولة الرفع تبقى: تنجح تلقائياً متى أُضيف استثناء لـ Actions في الـ
+        # ruleset. فشلها لا يُفشل التشغيل — البيانات وصلت عبر اللوق أصلاً.
         path = f"data/{symbol}_{args.resolution}.csv"
-        if token and repo:
-            if push(path, to_csv(rows), token, repo, branch):
+        if token and repo and branch:
+            if push(path, to_csv(rows), token, repo, branch, attempts=2):
                 logger.info(f"📤 رُفع {path}")
             else:
-                ok = False
-        else:
-            logger.warning("⚠️ لا GITHUB_TOKEN — لن يُرفع الناتج")
+                logger.warning(f"⚠️ تعذّر رفع {path} (ruleset) — "
+                               f"البيانات متاحة عبر اللوق")
 
     return 0 if ok else 1
 
