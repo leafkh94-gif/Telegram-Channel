@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vwap_bot"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "trend_bot"))
 
 from config import SYMBOLS, CAPITAL_BASE_URL  # noqa: E402
 from capital_client import CapitalClient      # noqa: E402

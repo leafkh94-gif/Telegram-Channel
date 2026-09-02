@@ -4,7 +4,7 @@ reporter.py — التقرير اليومي للأداء
 ثلاثة فروق مقصودة عن نص التعليمات، وسببها:
 
 1. المكان: التعليمات تضعه في جذر المشروع. الـ workflow يشغّل
-   `python vwap_bot/main.py`، فيصير sys.path[0] هو vwap_bot/ ولا يرى الجذر —
+   `python trend_bot/main.py`، فيصير sys.path[0] هو trend_bot/ ولا يرى الجذر —
    `import reporter` كان سيفشل، والـ try/except ImportError في التعليمات كان
    سيبتلع الفشل بصمت فيبقى التقرير ميتاً بلا أي رسالة خطأ. (تم التحقق عملياً.)
 
