@@ -30,7 +30,8 @@ import strategy
 from position import Position, open_position, update, risk_unit
 from risk_manager import can_trade, calculate_lot_size
 from telegram_bot import (
-    send_message, format_entry, format_trail, format_exit, process_commands,
+    send_message, format_entry, format_trail, format_exit, format_partial,
+    process_commands,
 )
 
 logging.basicConfig(
@@ -120,7 +121,8 @@ def scan_symbol(symbol: str, cfg: dict, client: CapitalClient, mode: str) -> Non
 
     # ── إدارة صفقة قائمة
     if pos is not None:
-        before = pos.stop
+        before      = pos.stop
+        had_partial = pos.partial_price is not None
         pos, ex = update(pos, bar)
         if ex:
             _positions.pop(symbol, None)
@@ -129,6 +131,15 @@ def scan_symbol(symbol: str, cfg: dict, client: CapitalClient, mode: str) -> Non
             logger.info(f"🚪 {symbol} خروج {ex.reason} @ {ex.price:.2f} | {ex.r:+.2f}R")
             return
         _positions[symbol] = pos
+
+        # الجني الجزئي حدث في هذه الشمعة — نُبلغ عنه، ولا نُبلغ عن رفع الوقف
+        # المصاحب له في نفس اللحظة حتى لا تصل رسالتان عن حدث واحد.
+        if not had_partial and pos.partial_price is not None:
+            _last_trail[symbol] = pos.stop
+            send_message(format_partial(symbol, pos))
+            logger.info(f"💰 {symbol} جني جزئي @ {pos.partial_price:.2f} | "
+                        f"محقّق {pos.booked:+.2f}R | الوقف → الدخول")
+            return
         moved = pos.stop - _last_trail.get(symbol, before)
         if moved >= TRAIL_ALERT_PCT * risk_unit(pos):
             _last_trail[symbol] = pos.stop

@@ -55,11 +55,32 @@ def format_trail(symbol: str, pos) -> str:
     )
 
 
+def format_partial(symbol: str, pos) -> str:
+    gained = pos.partial_price - pos.entry
+    return (
+        f"💰 <b>جني جزئي — {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"أغلقنا {int((1 - pos.size) * 100)}% عند "
+        f"<code>{pos.partial_price:.2f}</code>\n"
+        f"الربح المحقّق: <b>{gained:+.2f}</b> نقطة\n"
+        f"الباقي يتبع، ووقفه الآن عند الدخول "
+        f"<code>{pos.entry:.2f}</code> — لا خسارة ممكنة بعد الآن"
+    )
+
+
 def format_exit(symbol: str, pos, ex) -> str:
+    # ex.r يجمع الجزء المحقّق سابقاً مع الجزء المتبقّي، فنُظهر التفصيل بدلاً من
+    # رقم واحد يبدو غامضاً بعد جني جزئي.
+    detail = ""
+    if pos.partial_price is not None:
+        detail = (f"جني سابق: <code>{pos.partial_price:.2f}</code> "
+                  f"({pos.booked:+.2f}R)\n"
+                  f"الباقي  : {int(pos.size * 100)}% خرج الآن\n")
     return (
         f"{'✅' if ex.r > 0 else '❌'} <b>خروج — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"الدخول : <code>{pos.entry:.2f}</code>\n"
+        f"{detail}"
         f"الخروج : <code>{ex.price:.2f}</code>\n"
         f"النتيجة: <b>{ex.r:+.2f}R</b>\n"
         f"السبب  : {'الوقف المتحرّك' if ex.reason == 'SL' else 'انتهاء المدة'}"
