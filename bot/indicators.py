@@ -5,7 +5,6 @@ indicators.py — EMA و ATR
 
 import logging
 from datetime import datetime, timezone
-from config import ATR_PERIOD
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +21,7 @@ def calculate_ema(values: list[float], period: int) -> list[float]:
 
 
 # ─── ATR ──────────────────────────────────────────────────────────────────────
-def calculate_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
+def calculate_atr(candles: list[dict], period: int = 14) -> float:
     if len(candles) < period + 1:
         return 0.0
 
