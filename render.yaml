@@ -3,8 +3,8 @@ services:
     name: gold-alert-bot
     env: python
     plan: free
-    buildCommand: pip install -r scalping_bot/requirements.txt
-    startCommand: python scalping_bot/main.py
+    buildCommand: pip install -r vwap_bot/requirements.txt
+    startCommand: python vwap_bot/main.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
