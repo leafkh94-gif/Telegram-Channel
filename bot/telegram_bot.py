@@ -24,66 +24,63 @@ def send_message(text: str) -> bool:
         return False
 
 
-def format_entry(sig, lot: float) -> str:
-    risk = sig.entry - sig.sl
+def format_entry(sig) -> str:
+    arrow = "🟢 شراء" if sig.direction == "BUY" else "🔴 بيع"
+    trend = "فوق" if sig.direction == "BUY" else "تحت"
     return (
-        f"🟢 <b>دخول شراء — {sig.symbol}</b>\n"
+        f"{arrow} <b>{sig.symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"الدخول    : <code>{sig.entry}</code>\n"
-        f"الوقف     : <code>{sig.sl}</code>  ({risk:.1f} نقطة)\n"
-        f"الحجم     : <code>{lot}</code> لوت\n"
+        f"الدخول : <code>{sig.entry}</code>\n"
+        f"الوقف  : <code>{sig.sl}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>لا يوجد هدف ثابت.</b>\n"
-        f"الوقف يتحرّك خلف السعر بـ {sig.trail_atr}×ATR،\n"
-        f"والصفقة تُغلق حين يُضرب — وسأخبرك بذلك.\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"اليومي  : {sig.daily_close} فوق EMA {sig.daily_ema} ✓\n"
-        f"الاختراق: قناة {sig.channel_high}\n"
+        f"اليومي : {sig.daily_close} {trend} EMA {sig.daily_ema} ✓\n"
+        f"الاختراق: قناة 24 ساعة عند {sig.channel}\n"
         f"ATR ساعة: {sig.atr}"
     )
 
 
+def format_partial(symbol: str, pos) -> str:
+    from position import sign, stop_price
+    gained = (pos.partial_price - pos.entry) * sign(pos)
+    return (
+        f"💰 <b>جني جزئي — {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"أغلقنا {int((1 - pos.size) * 100)}% عند <code>{pos.partial_price:.2f}</code>\n"
+        f"الربح المحقّق: <b>{gained:+.2f}</b> نقطة ({pos.booked:+.2f}R)\n"
+        f"الباقي يتبع، ووقفه الآن عند الدخول <code>{pos.entry:.2f}</code>\n"
+        f"لا خسارة ممكنة على هذه الصفقة بعد الآن"
+    )
+
+
 def format_trail(symbol: str, pos) -> str:
-    locked = pos.stop - pos.entry
-    state = ("🔒 <b>الوقف فوق الدخول — الصفقة مؤمّنة</b>" if locked > 0
-             else "الوقف ما زال تحت الدخول")
+    from position import sign, stop_price
+    sp     = stop_price(pos)
+    locked = (sp - pos.entry) * sign(pos)
+    state  = ("🔒 الوقف تجاوز الدخول — الصفقة مؤمّنة" if locked > 0
+              else "الوقف ما زال دون الدخول")
     return (
         f"🔺 <b>تحديث وقف — {symbol}</b>\n"
-        f"الوقف الجديد: <code>{pos.stop:.2f}</code>\n"
+        f"الوقف الجديد: <code>{sp:.2f}</code>\n"
         f"الدخول كان : <code>{pos.entry:.2f}</code>\n"
         f"{state}"
     )
 
 
-def format_partial(symbol: str, pos) -> str:
-    gained = pos.partial_price - pos.entry
-    return (
-        f"💰 <b>جني جزئي — {symbol}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"أغلقنا {int((1 - pos.size) * 100)}% عند "
-        f"<code>{pos.partial_price:.2f}</code>\n"
-        f"الربح المحقّق: <b>{gained:+.2f}</b> نقطة\n"
-        f"الباقي يتبع، ووقفه الآن عند الدخول "
-        f"<code>{pos.entry:.2f}</code> — لا خسارة ممكنة بعد الآن"
-    )
-
-
 def format_exit(symbol: str, pos, ex) -> str:
-    # ex.r يجمع الجزء المحقّق سابقاً مع الجزء المتبقّي، فنُظهر التفصيل بدلاً من
-    # رقم واحد يبدو غامضاً بعد جني جزئي.
+    # ex.r يجمع المحقّق سابقاً مع المتبقّي، فنُظهر التفصيل لا رقماً غامضاً
     detail = ""
     if pos.partial_price is not None:
         detail = (f"جني سابق: <code>{pos.partial_price:.2f}</code> "
                   f"({pos.booked:+.2f}R)\n"
                   f"الباقي  : {int(pos.size * 100)}% خرج الآن\n")
+    side = "شراء" if pos.side == "BUY" else "بيع"
     return (
-        f"{'✅' if ex.r > 0 else '❌'} <b>خروج — {symbol}</b>\n"
+        f"{'✅' if ex.r > 0 else '❌'} <b>خروج {side} — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"الدخول : <code>{pos.entry:.2f}</code>\n"
         f"{detail}"
         f"الخروج : <code>{ex.price:.2f}</code>\n"
-        f"النتيجة: <b>{ex.r:+.2f}R</b>\n"
-        f"السبب  : {'الوقف المتحرّك' if ex.reason == 'SL' else 'انتهاء المدة'}"
+        f"النتيجة: <b>{ex.r:+.2f}R</b>"
     )
 
 

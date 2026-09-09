@@ -1,42 +1,44 @@
 """
 backtest.py — يشغّل **كود البوت نفسه** على بيانات تاريخية
 
-هذا هو الفرق الجوهري عن كل قياس سابق: لا يعيد كتابة المنطق. يستدعي
-strategy.scan و position.update — نفس الدوال التي ستعمل حيّاً. أي رقم يخرج
-من هنا هو رقم عن سلوك البوت الفعلي، لا عن نسخة موازية منه.
+الفرق الجوهري عن أي قياس موازٍ: لا يعيد كتابة المنطق. يستدعي strategy.scan
+و position.update — نفس الدالتين اللتين ستعملان حيّاً. أي رقم يخرج من هنا هو
+رقم عن سلوك البوت الفعلي.
 
 الحاجة إليه ظهرت بالطريقة الصعبة: قياسان مستقلان لنفس الاستراتيجية على نفس
-البيانات أعطيا ‎+0.105R و ‎-0.021R.
+البيانات أعطيا ‎+0.105R و ‎-0.021R، لأن إدارة الصفقة كانت مكتوبة مرتين.
 """
 
 import os
+import statistics
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "trend_bot"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 
-import strategy                                    # noqa: E402
-from position import open_position, update         # noqa: E402
+import strategy                                              # noqa: E402
+from position import open_position, update, risk_unit        # noqa: E402
 
 
-def _coarse_index(fine: list[dict], coarse: list[dict]) -> list[int]:
+def daily_index(h1: list[dict], daily: list[dict]) -> list[int]:
     """
-    لكل شمعة دقيقة: فهرس آخر شمعة خشنة **مكتملة**.
+    لكل شمعة ساعة: فهرس آخر شمعة يومية **مكتملة**.
 
-    الـ -1 مقصود: الشمعة الخشنة التي بدأت ولم تُغلق بعد لا يعرف البوت الحيّ
+    الـ -1 مقصود: الشمعة اليومية التي بدأت ولم تُغلق لا يعرف البوت الحيّ
     نتيجتها، فاستعمالها هنا نظر إلى المستقبل يجعل النتائج أفضل مما ستكون.
     """
     out, j = [], -1
-    ct = [c["time"] for c in coarse]
-    for c in fine:
-        while j + 1 < len(ct) and ct[j + 1] < c["time"]:
+    dt = [c["time"] for c in daily]
+    for c in h1:
+        while j + 1 < len(dt) and dt[j + 1] < c["time"]:
             j += 1
         out.append(j - 1)
     return out
 
 
-def run(symbol: str, daily: list[dict], h4: list[dict], h1: list[dict],
-        spread: float = 0.0, warmup: int = 80) -> dict:
-    i4, idd = _coarse_index(h1, h4), _coarse_index(h1, daily)
+def run(symbol: str, daily: list[dict], h1: list[dict],
+        spread: float = 0.0, warmup: int = 60) -> dict:
+    """صفقة واحدة مفتوحة في كل لحظة لكل أداة — تماماً كما يعمل البوت."""
+    idd = daily_index(h1, daily)
     trades, pos = [], None
 
     for i in range(warmup, len(h1)):
@@ -45,27 +47,30 @@ def run(symbol: str, daily: list[dict], h4: list[dict], h1: list[dict],
         if pos is not None:
             pos, ex = update(pos, bar, spread)
             if ex:
-                trades.append(ex.r)
+                trades.append({"time": pos.opened_at, "side": pos.side,
+                               "r": ex.r, "pts": ex.r * risk_unit(pos),
+                               "partial": pos.partial_price is not None})
                 pos = None
             continue
 
-        di, fi = idd[i], i4[i]
-        if di < 25 or fi < 25:
+        di = idd[i]
+        if di < 25:
             continue
 
-        # الشموع المُمرّرة مغلقة كلها، تماماً كما يستدعيها البوت الحيّ.
-        # m5 هنا الشمعة الحالية: حارس الملاحقة يقارن السعر بمستوى الاختراق،
-        # وسعر الإغلاق هو أدقّ ما نملكه تاريخياً لتلك اللحظة.
-        sig = strategy.scan(symbol, daily[:di + 1], h4[:fi + 1],
-                            h1[:i + 1], [bar])
+        # شموع مغلقة فقط، تماماً كما يستدعيها البوت الحيّ
+        sig = strategy.scan(symbol, daily[:di + 1], h1[:i + 1])
         if sig:
-            pos = open_position(symbol, sig.entry + spread / 2, sig.atr,
+            pos = open_position(symbol, sig.direction, sig.entry, sig.atr,
                                 bar["time"])
 
-    n = len(trades)
-    if n == 0:
-        return {"n": 0, "wr": 0.0, "R": 0.0, "per": 0.0}
-    wins = [t for t in trades if t > 0]
-    return {"n": n, "wr": len(wins) / n * 100,
-            "R": sum(trades), "per": sum(trades) / n,
-            "best": max(trades), "worst": min(trades)}
+    if not trades:
+        return {"n": 0}
+    rs = [t["r"] for t in trades]
+    return {
+        "n": len(rs),
+        "wr": sum(1 for r in rs if r > 0) / len(rs) * 100,
+        "R": statistics.mean(rs),
+        "total": sum(rs),
+        "pts": statistics.mean(t["pts"] for t in trades),
+        "trades": trades,
+    }
