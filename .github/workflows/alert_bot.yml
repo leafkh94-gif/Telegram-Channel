@@ -1,0 +1,81 @@
+name: Trading Alert Bot
+
+# تشغيل متواصل على مستودع عام (دقائق Actions مجانية بلا حدّ).
+#
+# كيف يعمل:
+#   * كل تشغيل ينفّذ bot/main.py لنحو 5 ساعات و40 دقيقة ثم يخرج بنظافة.
+#   * في نهايته تُطلق خطوة "السلسلة الذاتية" التشغيل التالي عبر واجهة GitHub،
+#     فلا تنقطع التغطية.
+#   * مجموعة التزامن تمنع وجود نسختين تعملان معاً.
+#
+# لا يوجد cron عمداً.
+# النسخة السابقة كان فيها حارس يومي، وقد جعل "أوقف البوت" غير قابل للتنفيذ
+# فعلياً: إلغاء التشغيل ينهي ذلك التشغيل وحده، ثم يعيد الحارس إطلاقه في اليوم
+# التالي. الآن الإقلاع قرار صريح من تبويب Actions، وإلغاء التشغيل إيقاف نهائي.
+
+on:
+  workflow_dispatch:        # الإقلاع اليدوي هو الطريقة الوحيدة للبدء
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  actions: write    # لازمة للسلسلة الذاتية
+  contents: read
+
+concurrency:
+  group: trading-bot
+  # التشغيل الأحدث يلغي الأقدم: أي كود جديد يُدمج يعمل فوراً بدل أن ينتظر
+  # انتهاء تشغيل قديم يمسك المكان لست ساعات.
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r bot/requirements.txt
+
+      - name: Run alert bot (continuous, ~5h40m then clean handoff)
+        run: |
+          start=$(date +%s)
+          timeout 20400 python bot/main.py || true
+          echo "RUN_ELAPSED=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+        env:
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          CAPITAL_API_KEY:      ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_IDENTIFIER:   ${{ secrets.CAPITAL_IDENTIFIER }}
+          CAPITAL_PASSWORD:     ${{ secrets.CAPITAL_PASSWORD }}
+          CAPITAL_DEMO:         "false"
+          # التنفيذ الفعلي للأوامر يتطلّب ضبط BOT_MODE=full_auto صراحةً.
+          BOT_MODE:             alert_only
+
+      - name: Self-chain — queue the next run immediately
+        if: always()
+        run: |
+          # حارس ضد حلقة الانهيار: لا نُسلّم إلا إذا عمل البوت مدة معقولة.
+          # الخروج السريع يعني انهياراً عند الإقلاع، وإعادة الإطلاق حينها
+          # تُغرق الحساب برسائل "البوت يعمل" كل بضع ثوانٍ — وقد حدث فعلاً.
+          # ولأن لا cron هنا، فإن التوقف عن التسلسل توقّف نهائي حتى تُقلعه يدوياً.
+          if [ "${RUN_ELAPSED:-0}" -lt 300 ]; then
+            echo "Bot exited after ${RUN_ELAPSED:-0}s (<300s) — NOT self-chaining."
+            exit 0
+          fi
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/alert_bot.yml/dispatches" \
+            -d '{"ref":"main"}'
+          echo "Next run queued."
