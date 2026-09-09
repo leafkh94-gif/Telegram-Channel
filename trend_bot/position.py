@@ -17,12 +17,19 @@ position.py — دورة حياة الصفقة، مصدر وحيد للحقيق�
 
 2. مدة الاحتفاظ القصوى. كان أحد التنفيذين يغلق بعد 240 شمعة والآخر لا يغلق
    أبداً. الآن سياسة واحدة صريحة قابلة للضبط (None = نحتفظ حتى يُضرب الوقف).
+
+الخروج الجزئي (PARTIAL_TARGET_ATR) يعيش هنا للسبب نفسه: لحظة كتابته في مكانين
+يصير رقمان لنفس الاستراتيجية. ترتيبه داخل الشمعة مُثبَّت أيضاً — الوقف يُفحص
+قبله، والتتبّع يُحدَّث بعده — لأن الشمعة لا تخبرنا أيّ المستويات لُمس أولاً.
 """
 
 from dataclasses import dataclass
 from typing import Optional
 
-from config import STOP_ATR, TRAIL_ATR, MAX_HOLD_BARS
+from config import (
+    STOP_ATR, TRAIL_ATR, MAX_HOLD_BARS,
+    PARTIAL_TARGET_ATR, PARTIAL_FRACTION,
+)
 
 
 @dataclass
@@ -34,6 +41,9 @@ class Position:
     atr:     float          # ATR لحظة الدخول؛ ثابت طوال الصفقة
     bars:    int = 0
     opened_at: str = ""
+    size:    float = 1.0    # ما تبقّى من الكمية بعد أي خروج جزئي
+    booked:  float = 0.0    # R محقّقة فعلاً من الخروج الجزئي
+    partial_price: Optional[float] = None   # سعر الخروج الجزئي إن حدث
 
 
 @dataclass
@@ -66,17 +76,31 @@ def update(pos: Position, candle: dict, spread: float = 0.0
 
     # 1) الخروج أولاً، بالوقف الموروث من الشمعة السابقة
     if candle["low"] - spread / 2 <= pos.stop:
-        r = ((pos.stop - pos.entry) - spread) / risk_unit(pos)
+        r = pos.booked + pos.size * (((pos.stop - pos.entry) - spread)
+                                     / risk_unit(pos))
         return pos, Exit("SL", pos.stop, r)
 
-    # 2) ثم يرتفع الوقف المتحرّك — ولا ينزل أبداً
+    # 2) الخروج الجزئي: نصف الكمية عند 1×ATR، ثم وقف الباقي إلى الدخول.
+    #    يأتي بعد فحص الوقف وقبل رفع التتبّع — الشمعة التي تلمس الهدف والوقف
+    #    معاً تُقرأ خاسرةً، وهي القراءة الوحيدة التي لا تفترض ترتيباً لا نعرفه.
+    if PARTIAL_TARGET_ATR is not None and pos.partial_price is None:
+        target = pos.entry + PARTIAL_TARGET_ATR * pos.atr
+        if candle["high"] >= target:
+            pos.booked += PARTIAL_FRACTION * (((target - pos.entry) - spread)
+                                              / risk_unit(pos))
+            pos.size   -= PARTIAL_FRACTION
+            pos.stop    = max(pos.stop, pos.entry)   # الباقي بلا مخاطرة
+            pos.partial_price = target
+
+    # 3) ثم يرتفع الوقف المتحرّك — ولا ينزل أبداً
     pos.highest = max(pos.highest, candle["high"])
     pos.stop    = max(pos.stop, pos.highest - TRAIL_ATR * pos.atr)
 
-    # 3) مدة الاحتفاظ القصوى، إن وُجدت
+    # 4) مدة الاحتفاظ القصوى، إن وُجدت
     if MAX_HOLD_BARS is not None and pos.bars >= MAX_HOLD_BARS:
         px = candle["close"]
-        r  = ((px - pos.entry) - spread) / risk_unit(pos)
+        r  = pos.booked + pos.size * (((px - pos.entry) - spread)
+                                      / risk_unit(pos))
         return pos, Exit("MAXHOLD", px, r)
 
     return pos, None
