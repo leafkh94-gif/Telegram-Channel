@@ -10,11 +10,19 @@ logger = logging.getLogger(__name__)
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 
-def send_message(text: str) -> bool:
+def send_message(text: str, chat_id: str | int | None = None) -> bool:
+    """
+    يُرسل إلى القناة المُعدّة افتراضياً، أو إلى محادثة بعينها عند تمريرها.
+
+    الردّ على الأوامر يجب أن يعود إلى حيث كُتب الأمر: الردّ الثابت على
+    TELEGRAM_CHAT_ID يعني أن أمراً تكتبه في الخاص يُجاب في القناة، فتظنّ أن
+    البوت لم يسمعك.
+    """
     try:
         r = requests.post(
             f"{BASE_URL}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={"chat_id": chat_id or TELEGRAM_CHAT_ID,
+                  "text": text, "parse_mode": "HTML"},
             timeout=10
         )
         r.raise_for_status()
@@ -150,18 +158,32 @@ def process_commands(bot_state: dict, status_fn=None) -> dict:
     """
     for update in get_updates(bot_state.get("offset", 0)):
         bot_state["offset"] = update["update_id"] + 1
-        text = update.get("message", {}).get("text", "").strip().lower()
 
-        if text in ("/status", "/حالة"):
+        # أمر مكتوب في قناة يصل كـ channel_post لا message. قراءة "message"
+        # وحدها كانت تتجاهله بصمت — والأدوات هنا تُنشر في قناة، فكل أمر
+        # كُتب فيها كان يُهمَل وكأن البوت أصمّ.
+        msg = (update.get("message") or update.get("channel_post")
+               or update.get("edited_message") or update.get("edited_channel_post")
+               or {})
+        text = (msg.get("text") or "").strip().lower()
+        if not text:
+            continue
+        # الردّ يعود إلى حيث كُتب الأمر، لا إلى القناة دائماً
+        origin = (msg.get("chat") or {}).get("id")
+
+        # تيليغرام يسمح بـ/status@BotName في المجموعات والقنوات
+        cmd = text.split("@", 1)[0].split()[0]
+
+        if cmd in ("/status", "/حالة"):
             lines = [f"الوضع: <b>{bot_state.get('mode')}</b>",
                      "⏸ متوقف مؤقتاً" if bot_state.get("paused") else "▶️ يعمل"]
             if status_fn:
                 lines += status_fn()
-            send_message("\n".join(lines))
-        elif text in ("/pause", "/ايقاف"):
+            send_message("\n".join(lines), origin)
+        elif cmd in ("/pause", "/ايقاف"):
             bot_state["paused"] = True
-            send_message("⏸ متوقف مؤقتاً — أرسل /resume للاستئناف")
-        elif text in ("/resume", "/استئناف"):
+            send_message("⏸ متوقف مؤقتاً — أرسل /resume للاستئناف", origin)
+        elif cmd in ("/resume", "/استئناف"):
             bot_state["paused"] = False
-            send_message("▶️ استُؤنف")
+            send_message("▶️ استُؤنف", origin)
     return bot_state

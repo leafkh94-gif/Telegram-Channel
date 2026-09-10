@@ -81,7 +81,8 @@ def test_pause_and_resume_commands(monkeypatch, cmd, expect_paused):
     monkeypatch.setattr(tg, "get_updates",
                         lambda offset=0: [{"update_id": 1,
                                            "message": {"text": cmd}}])
-    monkeypatch.setattr(tg, "send_message", lambda text: sent.append(text))
+    monkeypatch.setattr(tg, "send_message",
+                        lambda text, chat_id=None: sent.append(text))
     state = tg.process_commands({"mode": "alert_only", "paused": not expect_paused,
                                  "offset": 0})
     assert state["paused"] is expect_paused
@@ -95,7 +96,8 @@ def test_status_command_uses_the_callback(monkeypatch):
     monkeypatch.setattr(tg, "get_updates",
                         lambda offset=0: [{"update_id": 7,
                                            "message": {"text": "/status"}}])
-    monkeypatch.setattr(tg, "send_message", lambda text: sent.append(text))
+    monkeypatch.setattr(tg, "send_message",
+                        lambda text, chat_id=None: sent.append(text))
     tg.process_commands({"mode": "alert_only", "paused": False, "offset": 0},
                         status_fn=lambda: ["• XAUUSD BUY دخول 3650.00"])
     assert sent and "XAUUSD" in sent[0]
@@ -170,3 +172,56 @@ def test_check_receive_is_quiet_when_nothing_is_wrong(monkeypatch):
 
     monkeypatch.setattr(tg.requests, "get", lambda *a, **k: G())
     assert tg.check_receive() is None
+
+
+def _update(kind, text, chat_id=-100123, uid=1):
+    return {"update_id": uid, kind: {"text": text, "chat": {"id": chat_id}}}
+
+
+@pytest.mark.parametrize("kind", ["message", "channel_post",
+                                  "edited_message", "edited_channel_post"])
+def test_commands_are_read_from_every_update_kind(monkeypatch, kind):
+    """
+    أمر مكتوب في قناة يصل كـchannel_post لا message. قراءة "message" وحدها
+    كانت تُسقطه بصمت — والإشارات هنا تُنشر في قناة، فبدا البوت أصمّ تماماً.
+    """
+    (tg,) = _load("telegram_bot")
+    sent = []
+    monkeypatch.setattr(tg, "get_updates", lambda offset=0: [_update(kind, "/status")])
+    monkeypatch.setattr(tg, "send_message",
+                        lambda text, chat_id=None: sent.append((text, chat_id)))
+    tg.process_commands({"mode": "alert_only", "paused": False, "offset": 0})
+    assert sent, f"أُهمل الأمر الوارد كـ{kind}"
+
+
+def test_reply_goes_back_to_where_the_command_was_written(monkeypatch):
+    (tg,) = _load("telegram_bot")
+    sent = []
+    monkeypatch.setattr(tg, "get_updates",
+                        lambda offset=0: [_update("message", "/status", chat_id=555)])
+    monkeypatch.setattr(tg, "send_message",
+                        lambda text, chat_id=None: sent.append((text, chat_id)))
+    tg.process_commands({"mode": "alert_only", "paused": False, "offset": 0})
+    assert sent[0][1] == 555, "الردّ لم يعد إلى محادثة الأمر"
+
+
+def test_command_with_bot_suffix_is_understood(monkeypatch):
+    """في المجموعات والقنوات يكتب تيليغرام الأمر بصيغة /status@BotName."""
+    (tg,) = _load("telegram_bot")
+    sent = []
+    monkeypatch.setattr(tg, "get_updates",
+                        lambda offset=0: [_update("message", "/status@MyTradeBot")])
+    monkeypatch.setattr(tg, "send_message",
+                        lambda text, chat_id=None: sent.append(text))
+    tg.process_commands({"mode": "alert_only", "paused": False, "offset": 0})
+    assert sent
+
+
+def test_update_without_text_is_skipped(monkeypatch):
+    """صورة أو انضمام عضو يصل بلا نص — يجب ألا يُسقط الحلقة."""
+    (tg,) = _load("telegram_bot")
+    monkeypatch.setattr(tg, "get_updates",
+                        lambda offset=0: [{"update_id": 3,
+                                           "message": {"chat": {"id": 1}}}])
+    st = tg.process_commands({"mode": "alert_only", "paused": False, "offset": 0})
+    assert st["offset"] == 4
