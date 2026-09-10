@@ -149,6 +149,19 @@ def scan_symbol(symbol: str, cfg: dict, client: CapitalClient) -> None:
     logger.info(f"📤 إشارة: {symbol} {sig.direction} @ {sig.entry:.2f}")
 
 
+def _status_lines() -> list[str]:
+    """سطور الصفقات القائمة لأمر /status. تُمرَّر إلى telegram_bot كدالة حتى
+    تبقى تلك الوحدة جاهلة بالصفقات تماماً."""
+    if not _positions:
+        return ["لا صفقات قائمة"]
+    out = []
+    for s, p in _positions.items():
+        half = " (نصف مجنيّ)" if p.partial_price is not None else ""
+        out.append(f"• {s} {p.side} دخول {p.entry:.2f} "
+                   f"وقف {stop_price(p):.2f}{half}")
+    return out
+
+
 def main() -> None:
     logger.info("🚀 بوت الاتجاه — يومي/ساعة، شراء وبيع")
     client = CapitalClient()
@@ -182,9 +195,19 @@ def main() -> None:
     )
 
     state = {"mode": BOT_MODE, "paused": False, "offset": 0}
+
+    # خطأ متكرّر بنفس النص يعني عطلاً دائماً لا انقطاعاً عابراً، ويجب أن يصل.
+    #
+    # سبب وجود هذا: خطأ ImportError في أول سطر من الحلقة أوقف الفحص تماماً
+    # وبقي البوت 23 ساعة يسجّله كل 30 ثانية دون أن يعرف أحد. كل المؤشرات
+    # الخارجية كانت خضراء — التشغيل يكمل مدته، والسلسلة تُسلّم، والرسالة
+    # الافتتاحية تصل — لأن الحلقة كانت تبتلع كل استثناء بنفس الطريقة.
+    # الصمت هنا لم يكن "لا توجد إشارات"، بل "لا يوجد فحص".
+    last_err, err_count, alerted = None, 0, False
+
     while True:
         try:
-            state = process_commands(state)
+            state = process_commands(state, status_fn=_status_lines)
             if state["paused"] or is_weekend():
                 time.sleep(300 if is_weekend() else SCAN_INTERVAL_SECONDS)
                 continue
@@ -193,12 +216,26 @@ def main() -> None:
                     scan_symbol(symbol, cfg, client)
                 except Exception as e:
                     logger.error(f"❌ {symbol}: {e}")
+            last_err, err_count, alerted = None, 0, False
             time.sleep(SCAN_INTERVAL_SECONDS)
         except KeyboardInterrupt:
             send_message("🛑 البوت أُوقف يدوياً")
             break
         except Exception as e:
-            logger.error(f"❌ خطأ رئيسي: {e}")
+            msg = f"{type(e).__name__}: {e}"
+            err_count = err_count + 1 if msg == last_err else 1
+            last_err  = msg
+            logger.error(f"❌ خطأ رئيسي ({err_count}×): {msg}")
+            # عشر مرات متتالية ≈ خمس دقائق. عابرٌ يزول قبلها.
+            if err_count >= 10 and not alerted:
+                alerted = True
+                send_message(
+                    f"🚨 <b>البوت متوقّف عن الفحص</b>\n"
+                    f"نفس الخطأ تكرّر {err_count} مرات:\n"
+                    f"<code>{msg}</code>\n\n"
+                    f"التشغيل ما زال قائماً لكنه لا يفحص أي أداة — "
+                    f"لن تصلك إشارات حتى يُصلَح."
+                )
             time.sleep(30)
 
 
