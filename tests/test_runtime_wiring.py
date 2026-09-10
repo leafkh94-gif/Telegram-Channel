@@ -225,3 +225,42 @@ def test_update_without_text_is_skipped(monkeypatch):
                                            "message": {"chat": {"id": 1}}}])
     st = tg.process_commands({"mode": "alert_only", "paused": False, "offset": 0})
     assert st["offset"] == 4
+
+
+def test_get_updates_asks_for_channel_posts_explicitly(monkeypatch):
+    """
+    تيليغرام يحفظ آخر allowed_updates على التوكن ويستعمله عند إغفال الوسيط.
+    إن كان محصوراً بـmessage من كود قديم، لن يصل أي channel_post مهما صحّحنا
+    القراءة — فالتمرير الصريح هو ما يفتح القناة فعلاً.
+    """
+    import json as _json
+    (tg,) = _load("telegram_bot")
+    seen = {}
+
+    class R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"result": []}
+
+    def spy(url, params=None, timeout=None):
+        seen.update(params or {})
+        return R()
+
+    monkeypatch.setattr(tg.requests, "get", spy)
+    tg.get_updates()
+    assert "allowed_updates" in seen, "لم يُمرَّر allowed_updates"
+    assert "channel_post" in _json.loads(seen["allowed_updates"])
+
+
+def test_check_receive_flags_a_restricted_update_filter(monkeypatch):
+    (tg,) = _load("telegram_bot")
+
+    class G:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"result": {"url": "", "allowed_updates": ["message"]}}
+
+    monkeypatch.setattr(tg.requests, "get", lambda *a, **k: G())
+    msg = tg.check_receive()
+    assert msg and "محصورة" in msg
