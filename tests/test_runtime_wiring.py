@@ -110,3 +110,63 @@ def test_main_status_lines_reports_open_positions():
         assert "XAUUSD" in line and "BUY" in line
     finally:
         main._positions.clear()
+
+
+def test_get_updates_reports_a_blocked_receive_channel(monkeypatch, caplog):
+    """
+    409 من تيليغرام يعني webhook يحجب السحب. الصمت عنه يجعل "لا أوامر" و
+    "الاستقبال معطّل" متطابقين — وهو الالتباس نفسه الذي أخفى توقّف الفحص.
+    """
+    (tg,) = _load("telegram_bot")
+
+    class R:
+        status_code = 409
+    monkeypatch.setattr(tg.requests, "get", lambda *a, **k: R())
+    with caplog.at_level("ERROR"):
+        assert tg.get_updates() == []
+    assert any("409" in r.message or "webhook" in r.message for r in caplog.records)
+
+
+def test_get_updates_logs_network_failure_instead_of_swallowing(monkeypatch, caplog):
+    (tg,) = _load("telegram_bot")
+
+    def boom(*a, **k):
+        raise ConnectionError("no route")
+    monkeypatch.setattr(tg.requests, "get", boom)
+    with caplog.at_level("WARNING"):
+        assert tg.get_updates() == []
+    assert any("ConnectionError" in r.message for r in caplog.records)
+
+
+def test_check_receive_deletes_a_stale_webhook(monkeypatch):
+    """webhook باقٍ من كود محذوف يحجب الأوامر ولا يخدم أحداً — يُحذف."""
+    (tg,) = _load("telegram_bot")
+    posted = []
+
+    class G:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"result": {"url": "https://old.example/hook"}}
+
+    class P:
+        status_code = 200
+        def raise_for_status(self): pass
+
+    monkeypatch.setattr(tg.requests, "get", lambda *a, **k: G())
+    monkeypatch.setattr(tg.requests, "post",
+                        lambda *a, **k: (posted.append(a), P())[1])
+    msg = tg.check_receive()
+    assert msg and "webhook" in msg
+    assert posted, "لم يُطلب حذف الـwebhook"
+
+
+def test_check_receive_is_quiet_when_nothing_is_wrong(monkeypatch):
+    (tg,) = _load("telegram_bot")
+
+    class G:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"result": {"url": ""}}
+
+    monkeypatch.setattr(tg.requests, "get", lambda *a, **k: G())
+    assert tg.check_receive() is None
