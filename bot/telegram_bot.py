@@ -84,17 +84,6 @@ def format_exit(symbol: str, pos, ex) -> str:
     )
 
 
-def send_daily_stats(stats: dict):
-    status = "🟢 نشط" if not stats["halted"] else "🔴 متوقف"
-    send_message(
-        f"📈 <b>إحصائيات اليوم</b>\n"
-        f"الحالة        : {status}\n"
-        f"صفقات اليوم   : {stats['trades_today']}\n"
-        f"P&L اليوم     : {stats['daily_pnl']:.2f}\n"
-        f"خسائر متتالية : {stats['consec_losses']}"
-    )
-
-
 def get_updates(offset: int = 0) -> list[dict]:
     try:
         r = requests.get(f"{BASE_URL}/getUpdates",
@@ -105,34 +94,32 @@ def get_updates(offset: int = 0) -> list[dict]:
         return []
 
 
-def process_commands(bot_state: dict) -> dict:
-    from risk_manager import resume_trading, get_daily_stats
+def process_commands(bot_state: dict, status_fn=None) -> dict:
+    """
+    يعالج أوامر تيليغرام.
+
+    لا استيراد لوحدات غير موجودة هنا. النسخة السابقة كانت تستورد risk_manager
+    و reporter و tracker — وكلها حُذفت مع الاستراتيجية القديمة — فكانت ترمي
+    ImportError في أول سطر من كل دورة، فلا يُنفَّذ الفحص إطلاقاً. البوت بقي
+    كذلك 23 ساعة وكل المؤشرات الخارجية تقول إنه يعمل.
+
+    status_fn تُمرَّر من main.py وتُرجع سطور حالة الصفقات القائمة، فلا تحتاج
+    هذه الوحدة أن تعرف شيئاً عن الصفقات.
+    """
     for update in get_updates(bot_state.get("offset", 0)):
         bot_state["offset"] = update["update_id"] + 1
         text = update.get("message", {}).get("text", "").strip().lower()
-        if text in ("/report", "/تقرير"):
-            try:
-                from reporter import send_daily_report
-                send_daily_report()
-            except Exception:
-                send_message("⚠️ التقرير غير متاح حالياً")
-            continue
 
-        if text in ("/report7", "/week"):
-            from tracker import build_report
-            send_message(build_report(days=7))
-            continue
-
-        if text == "/status":
-            send_daily_stats(get_daily_stats())
-            send_message(f"الوضع: <b>{bot_state.get('mode')}</b>")
-        elif text == "/pause":
+        if text in ("/status", "/حالة"):
+            lines = [f"الوضع: <b>{bot_state.get('mode')}</b>",
+                     "⏸ متوقف مؤقتاً" if bot_state.get("paused") else "▶️ يعمل"]
+            if status_fn:
+                lines += status_fn()
+            send_message("\n".join(lines))
+        elif text in ("/pause", "/ايقاف"):
             bot_state["paused"] = True
-            send_message("⏸ متوقف مؤقتاً")
-        elif text == "/resume":
+            send_message("⏸ متوقف مؤقتاً — أرسل /resume للاستئناف")
+        elif text in ("/resume", "/استئناف"):
             bot_state["paused"] = False
-            resume_trading()
             send_message("▶️ استُؤنف")
-        elif text == "/stats":
-            send_daily_stats(get_daily_stats())
     return bot_state
