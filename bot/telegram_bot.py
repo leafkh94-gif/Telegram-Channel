@@ -84,13 +84,55 @@ def format_exit(symbol: str, pos, ex) -> str:
     )
 
 
+def check_receive() -> str | None:
+    """
+    يتحقّق أن استقبال الأوامر ممكن أصلاً، ويُصلح السبب الوحيد القابل للإصلاح.
+
+    تيليغرام لا يسمح بالسحب (getUpdates) وبالـwebhook معاً: إن كان على التوكن
+    webhook مسجَّل، يردّ على كل سحب بـ409 Conflict. المستودع كان فيه مجلد
+    webhook/ حُذف مع الكود القديم، فأي تسجيل باقٍ منه صار بلا مستقبِل — يمنع
+    الأوامر ولا يخدم شيئاً. نحذفه.
+
+    يُرجع نصاً يصف ما وجده، أو None إن كان كل شيء سليماً.
+    """
+    try:
+        r = requests.get(f"{BASE_URL}/getWebhookInfo", timeout=10)
+        r.raise_for_status()
+        info = r.json().get("result", {})
+    except Exception as e:
+        return f"تعذّر فحص قناة الاستقبال: {type(e).__name__}: {e}"
+
+    url = info.get("url") or ""
+    if not url:
+        return None
+
+    try:
+        d = requests.post(f"{BASE_URL}/deleteWebhook", timeout=10)
+        d.raise_for_status()
+        logger.warning(f"🔧 حُذف webhook قديم كان يمنع استقبال الأوامر: {url}")
+        return f"حُذف webhook قديم كان يحجب الأوامر ({url}) — الأوامر تعمل الآن"
+    except Exception as e:
+        return f"يوجد webhook يحجب الأوامر ({url}) وتعذّر حذفه: {e}"
+
+
 def get_updates(offset: int = 0) -> list[dict]:
+    """
+    يسحب التحديثات. الفشل يُسجَّل ولا يُبتلع.
+
+    كان هنا `except Exception: return []` صامت، فبدا انقطاع الاستقبال مطابقاً
+    تماماً لعدم وجود أوامر — وهي نفس الالتباس الذي أخفى توقّف الفحص 23 ساعة.
+    """
     try:
         r = requests.get(f"{BASE_URL}/getUpdates",
                          params={"offset": offset, "timeout": 5}, timeout=10)
+        if r.status_code == 409:
+            logger.error("❌ الاستقبال محجوب: يوجد webhook مسجَّل على التوكن "
+                         "(409 Conflict). الأوامر لن تصل.")
+            return []
         r.raise_for_status()
         return r.json().get("result", [])
-    except Exception:
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر سحب التحديثات: {type(e).__name__}: {e}")
         return []
 
 

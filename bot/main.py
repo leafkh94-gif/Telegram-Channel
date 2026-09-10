@@ -30,7 +30,7 @@ import strategy
 from position import Position, open_position, update, risk_unit, stop_price
 from telegram_bot import (
     send_message, format_entry, format_partial, format_trail, format_exit,
-    process_commands,
+    process_commands, check_receive,
 )
 
 logging.basicConfig(
@@ -184,6 +184,11 @@ def main() -> None:
         except Exception as e:
             logger.error(f"❌ إعادة بناء {symbol}: {e}")
 
+    # قناة الاستقبال منفصلة عن الإرسال وتفشل مستقلةً عنه: البوت قد يُرسل
+    # الإشارات بلا خلل بينما لا تصله أوامرك إطلاقاً. نفحصها ونقول النتيجة
+    # بدل أن يكتشفها المستخدم بإرسال أمر لا يُجاب.
+    recv = check_receive()
+
     send_message(
         f"🤖 <b>البوت يعمل</b>\n"
         f"الوضع: {BOT_MODE}\n"
@@ -191,7 +196,8 @@ def main() -> None:
         f"المنطق: اتجاه يومي ← اختراق قناة {ENTRY_CHANNEL_H1} ساعة | شراء وبيع\n"
         f"الوقف {STOP_ATR}×ATR | جني نصف عند {PARTIAL_TARGET_ATR}×ATR | "
         f"تتبّع {TRAIL_ATR}×ATR\n"
-        f"صفقات قائمة: {restored}"
+        f"صفقات قائمة: {restored}\n"
+        f"استقبال الأوامر: {'⚠️ ' + recv if recv else '✅ يعمل'}"
     )
 
     state = {"mode": BOT_MODE, "paused": False, "offset": 0}
