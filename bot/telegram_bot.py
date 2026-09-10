@@ -2,12 +2,19 @@
 telegram_bot.py — إرسال الإشارات وأوامر التحكم
 """
 
+import json
 import logging
+
 import requests
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 logger = logging.getLogger(__name__)
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+# يُمرَّر في كل سحب. تيليغرام يحفظ آخر قيمة على التوكن ويستعملها عند الحذف،
+# فالإغفال يعني الاعتماد على إعداد قد يكون وضعه كود لم يعد موجوداً.
+ALLOWED_UPDATES = json.dumps(
+    ["message", "edited_message", "channel_post", "edited_channel_post"])
 
 
 def send_message(text: str, chat_id: str | int | None = None) -> bool:
@@ -110,8 +117,16 @@ def check_receive() -> str | None:
     except Exception as e:
         return f"تعذّر فحص قناة الاستقبال: {type(e).__name__}: {e}"
 
-    url = info.get("url") or ""
+    allowed = info.get("allowed_updates")
+    url     = info.get("url") or ""
+
     if not url:
+        # allowed_updates محفوظ على التوكن ويبقى ساريَ المفعول حتى لو لم يعد
+        # أي webhook مسجّلاً. إن كان محصوراً بـmessage فلن يصل أي channel_post
+        # مهما صحّحنا القراءة — لذلك نُبلغ عنه، ونمرّره صراحةً في كل سحب.
+        if allowed and "channel_post" not in allowed:
+            return (f"أنواع التحديثات كانت محصورة بـ{allowed} — "
+                    f"أوامر القناة كانت محجوبة، وأُعيد فتحها الآن")
         return None
 
     try:
@@ -131,8 +146,13 @@ def get_updates(offset: int = 0) -> list[dict]:
     تماماً لعدم وجود أوامر — وهي نفس الالتباس الذي أخفى توقّف الفحص 23 ساعة.
     """
     try:
-        r = requests.get(f"{BASE_URL}/getUpdates",
-                         params={"offset": offset, "timeout": 5}, timeout=10)
+        r = requests.get(
+            f"{BASE_URL}/getUpdates",
+            params={"offset": offset, "timeout": 5,
+                    # صريح عمداً: حذفه يعني استعمال آخر إعداد محفوظ على
+                    # التوكن، وقد يكون محصوراً بـmessage من كود قديم.
+                    "allowed_updates": ALLOWED_UPDATES},
+            timeout=10)
         if r.status_code == 409:
             logger.error("❌ الاستقبال محجوب: يوجد webhook مسجَّل على التوكن "
                          "(409 Conflict). الأوامر لن تصل.")
